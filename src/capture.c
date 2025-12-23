@@ -1,12 +1,54 @@
 #include <gio/gio.h>
+#include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <libportal/portal.h>
+#include <stdio.h>
 
 static XdpSession *g_session;
 static GstElement *g_pipeline;
 
+static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
+        GstSample *sample;
+        GstBuffer *buffer;
+        GstMapInfo map;
+
+        sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
+        if (!sample) {
+                return GST_FLOW_ERROR;
+        }
+
+        buffer = gst_sample_get_buffer(sample);
+        if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+
+                printf("\033[2J\033[H");
+
+                // Print frame header
+                printf("Frame: %zu bytes (256x144 RGB)\n", map.size);
+                printf("====================================\n");
+
+                // Print all pixels
+                for (int y = 0; y < 144; y++) {
+                        for (int x = 0; x < 256; x++) {
+                                int offset = (y * 256 + x) * 3;
+                                unsigned char r = map.data[offset + 0];
+                                unsigned char g = map.data[offset + 1];
+                                unsigned char b = map.data[offset + 2];
+
+                                // Print RGB values with ANSI color background
+                                printf("\033[48;2;%d;%d;%dm  \033[0m", r, g, b);
+                        }
+                        printf("\n");
+                }
+
+                gst_buffer_unmap(buffer, &map);
+        }
+
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+}
+
 static void start_gstreamer(int fd, int node) {
-        GstElement *pipewiresrc, *videosink, *videorate, *videoscale, *videoconvert;
+        GstElement *pipewiresrc, *appsink, *videorate, *videoscale, *videoconvert;
         GstCaps *caps;
         gchar *path;
 
@@ -42,28 +84,33 @@ static void start_gstreamer(int fd, int node) {
                 return;
         }
 
-        videosink = gst_element_factory_make("autovideosink", NULL);
-        if (!videosink) {
-                g_printerr("Failed to create autovideosink\n");
+        appsink = gst_element_factory_make("appsink", NULL);
+        if (!appsink) {
+                g_printerr("Failed to create appsink\n");
                 return;
         }
+
+        g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop", TRUE,
+                     NULL);
+        g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), NULL);
 
         path = g_strdup_printf("%u", node);
         g_object_set(pipewiresrc, "fd", fd, "path", path, NULL);
         g_free(path);
 
         gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, videoconvert, videoscale, videorate,
-                         videosink, NULL);
+                         appsink, NULL);
 
         if (!gst_element_link_many(pipewiresrc, videoconvert, videoscale, videorate, NULL)) {
                 g_printerr("Failed to link elements\n");
                 return;
         }
 
-        caps = gst_caps_new_simple("video/x-raw", "width", G_TYPE_INT, 256, "height", G_TYPE_INT,
-                                   144, "framerate", GST_TYPE_FRACTION, 24, 1, NULL);
+        caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "RGB", "width",
+                                   G_TYPE_INT, 256, "height", G_TYPE_INT, 144, "framerate",
+                                   GST_TYPE_FRACTION, 1, 1, NULL);
 
-        if (!gst_element_link_filtered(videorate, videosink, caps)) {
+        if (!gst_element_link_filtered(videorate, appsink, caps)) {
                 g_printerr("Failed to link with caps filter\n");
                 gst_caps_unref(caps);
                 return;
@@ -72,7 +119,7 @@ static void start_gstreamer(int fd, int node) {
         gst_caps_unref(caps);
 
         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
-        g_print("Video playing at 144p @ 24fps\n");
+        g_print("Pipeline running, capturing frames...\n");
 }
 
 static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) {

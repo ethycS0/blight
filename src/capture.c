@@ -6,17 +6,45 @@ static XdpSession *g_session;
 static GstElement *g_pipeline;
 
 static void start_gstreamer(int fd, int node) {
-        GstElement *pipewiresrc, *videosink;
+        GstElement *pipewiresrc, *videosink, *videorate, *videoscale, *videoconvert;
+        GstCaps *caps;
         gchar *path;
 
         gst_init(NULL, NULL);
 
         g_pipeline = gst_pipeline_new("capture");
-        pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
-        videosink = gst_element_factory_make("autovideosink", NULL);
+        if (!g_pipeline) {
+                g_printerr("Failed to create pipeline\n");
+                return;
+        }
 
-        if (!g_pipeline || !pipewiresrc || !videosink) {
-                g_printerr("Failed to create elements\n");
+        pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
+        if (!pipewiresrc) {
+                g_printerr("Failed to create pipewiresrc\n");
+                return;
+        }
+
+        videoconvert = gst_element_factory_make("videoconvert", NULL);
+        if (!videoconvert) {
+                g_printerr("Failed to create videoconvert\n");
+                return;
+        }
+
+        videoscale = gst_element_factory_make("videoscale", NULL);
+        if (!videoscale) {
+                g_printerr("Failed to create videoscale\n");
+                return;
+        }
+
+        videorate = gst_element_factory_make("videorate", NULL);
+        if (!videorate) {
+                g_printerr("Failed to create videorate\n");
+                return;
+        }
+
+        videosink = gst_element_factory_make("autovideosink", NULL);
+        if (!videosink) {
+                g_printerr("Failed to create autovideosink\n");
                 return;
         }
 
@@ -24,12 +52,27 @@ static void start_gstreamer(int fd, int node) {
         g_object_set(pipewiresrc, "fd", fd, "path", path, NULL);
         g_free(path);
 
-        // Build and run
-        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, videosink, NULL);
-        gst_element_link(pipewiresrc, videosink);
-        gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
+        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, videoconvert, videoscale, videorate,
+                         videosink, NULL);
 
-        g_print("Video playing\n");
+        if (!gst_element_link_many(pipewiresrc, videoconvert, videoscale, videorate, NULL)) {
+                g_printerr("Failed to link elements\n");
+                return;
+        }
+
+        caps = gst_caps_new_simple("video/x-raw", "width", G_TYPE_INT, 256, "height", G_TYPE_INT,
+                                   144, "framerate", GST_TYPE_FRACTION, 24, 1, NULL);
+
+        if (!gst_element_link_filtered(videorate, videosink, caps)) {
+                g_printerr("Failed to link with caps filter\n");
+                gst_caps_unref(caps);
+                return;
+        }
+
+        gst_caps_unref(caps);
+
+        gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
+        g_print("Video playing at 144p @ 24fps\n");
 }
 
 static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) {

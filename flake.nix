@@ -30,6 +30,9 @@
             gst_all_1.gst-plugins-good
             gst_all_1.gst-plugins-bad
 
+            arduino-cli
+                                                python3
+
             pipewire
             glib
             libportal

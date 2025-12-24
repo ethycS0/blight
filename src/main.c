@@ -3,6 +3,7 @@
 #include <gst/gst.h>
 #include <libportal/portal.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "serial.h"
 
@@ -10,6 +11,8 @@
 #define CAPTURE_HEIGHT 144
 #define CAPTURE_DEPTH 10
 #define CAPTURE_FPS 24
+#define BRIGHTNESS 120
+#define SATURATION 1
 
 typedef struct {
         unsigned char r, g, b;
@@ -87,8 +90,8 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
                 ssize_t result = serial_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
 
                 if (result < 0) {
-                        printf("Error\n");
-                        exit(0);
+                        printf("Serial error\n");
+                        exit(1);
                 }
 
                 gst_buffer_unmap(buffer, &map);
@@ -112,38 +115,14 @@ static void start_gstreamer(int fd, int node) {
         }
 
         pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
-        if (!pipewiresrc) {
-                g_printerr("Failed to create pipewiresrc\n");
-                return;
-        }
-
         videoconvert = gst_element_factory_make("videoconvert", NULL);
-        if (!videoconvert) {
-                g_printerr("Failed to create videoconvert\n");
-                return;
-        }
-
         videoscale = gst_element_factory_make("videoscale", NULL);
-        if (!videoscale) {
-                g_printerr("Failed to create videoscale\n");
-                return;
-        }
-
         videorate = gst_element_factory_make("videorate", NULL);
-        if (!videorate) {
-                g_printerr("Failed to create videorate\n");
-                return;
-        }
-
         queue = gst_element_factory_make("queue", NULL);
-        if (!queue) {
-                g_printerr("Failed to create queue\n");
-                return;
-        }
-
         appsink = gst_element_factory_make("appsink", NULL);
-        if (!appsink) {
-                g_printerr("Failed to create appsink\n");
+
+        if (!pipewiresrc || !videoconvert || !videoscale || !videorate || !queue || !appsink) {
+                g_printerr("Failed to create elements\n");
                 return;
         }
 
@@ -179,7 +158,7 @@ static void start_gstreamer(int fd, int node) {
         gst_caps_unref(caps);
 
         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
-        g_print("Pipeline running, capturing frames...\n");
+        g_print("Pipeline running\n");
 }
 
 static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) {
@@ -198,11 +177,9 @@ static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) 
         if (streams) {
                 GVariantIter iter;
                 g_variant_iter_init(&iter, streams);
-
                 GVariant *options;
-
                 g_variant_iter_next(&iter, "(u@a{sv})", &node, &options);
-                g_print("PipeWire Node ID: %d\n", node);
+                g_print("PipeWire Node: %d\n", node);
                 g_variant_unref(options);
         }
 
@@ -223,17 +200,52 @@ static void create_session_cb(GObject *source, GAsyncResult *res, gpointer data)
                 return;
         }
 
-        g_print("Session created: %p\n", session);
+        g_print("Session created\n");
         g_session = session;
 
         xdp_session_start(session, NULL, NULL, start_session_cb, NULL);
 }
 
-int main() {
-        if (serial_init("/dev/ttyUSB0", 921600, 1000) == -1) {
-                printf("No Device Found\n");
+static int send_config(uint8_t brightness, uint8_t saturation_boost) {
+        uint8_t config_packet[4] = {
+            0xFF,            // Magic byte
+            0xAA,            // Config identifier
+            brightness,      // 0-255
+            saturation_boost // 0-100
+        };
+
+        ssize_t result = serial_tx(config_packet, sizeof(config_packet));
+        if (result < 0) {
+                printf("Config send failed\n");
                 return -1;
         }
+
+        usleep(600000);
+        return 0;
+}
+
+int main(int argc, const char *argv[]) {
+        uint8_t brightness = BRIGHTNESS;
+        uint8_t saturation = SATURATION;
+
+        if (argc >= 2) {
+                brightness = atoi(argv[1]);
+        }
+
+        if (argc >= 3) {
+                saturation = atoi(argv[2]);
+        }
+
+        if (serial_init("/dev/ttyUSB0", 921600, 1000) == -1) {
+                printf("No device found\n");
+                return -1;
+        }
+
+        if (send_config(brightness, saturation) == -1) {
+                return -1;
+        }
+
+        printf("Config sent: brightness=%d, saturation=%d\n", brightness, saturation);
 
         GMainLoop *loop = g_main_loop_new(NULL, FALSE);
         XdpPortal *portal = xdp_portal_new();

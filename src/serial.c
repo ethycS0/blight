@@ -9,7 +9,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include "linux_serial.h"
+#include "serial.h"
 
 typedef struct {
         int fd;

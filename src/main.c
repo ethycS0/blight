@@ -4,22 +4,25 @@
 #include <libportal/portal.h>
 #include <stdio.h>
 
+#include "serial.h"
+
 #define CAPTURE_WIDTH 256
 #define CAPTURE_HEIGHT 144
-#define CAPTURE_DEPTH 2
+#define CAPTURE_DEPTH 10
 #define CAPTURE_FPS 24
 
 typedef struct {
         unsigned char r, g, b;
 } RGB;
 
-static RGB
-    g_final_buffer[(2 * (CAPTURE_WIDTH / CAPTURE_DEPTH + CAPTURE_HEIGHT / CAPTURE_DEPTH)) * 3];
+static RGB g_final_buffer[((CAPTURE_HEIGHT - CAPTURE_DEPTH) / CAPTURE_DEPTH + 1) +
+                          ((CAPTURE_WIDTH + CAPTURE_DEPTH - 1) / CAPTURE_DEPTH) +
+                          ((CAPTURE_HEIGHT + CAPTURE_DEPTH - 1) / CAPTURE_DEPTH)];
 
 static XdpSession *g_session;
 static GstElement *g_pipeline;
 
-static void average_pixel_box(unsigned char *data, int start_x, int start_y, int box_size,
+static void average_pixel_box(const unsigned char *data, int start_x, int start_y, int box_size,
                               RGB *result) {
         int total_r = 0, total_g = 0, total_b = 0;
         int count = 0;
@@ -56,46 +59,37 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
 
         buffer = gst_sample_get_buffer(sample);
         if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-                memset(g_final_buffer, '0', sizeof(g_final_buffer));
+                memset(g_final_buffer, 0, sizeof(g_final_buffer));
 
                 int buffer_index = 0;
 
-                // 1. BOTTOM EDGE: Right to left (bottom-right to bottom-left)
-                for (int x = CAPTURE_WIDTH - CAPTURE_DEPTH; x >= 0; x -= CAPTURE_DEPTH) {
-                        int y = CAPTURE_HEIGHT - CAPTURE_DEPTH;
-                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
-                                          &g_final_buffer[buffer_index++]);
-                }
-
-                // 2. LEFT EDGE: Bottom to top (bottom-left to top-left)
+                // 1. LEFT EDGE: Bottom to top
                 for (int y = CAPTURE_HEIGHT - CAPTURE_DEPTH; y >= 0; y -= CAPTURE_DEPTH) {
                         int x = 0;
                         average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
                                           &g_final_buffer[buffer_index++]);
                 }
 
-                // 3. TOP EDGE: Left to right (top-left to top-right)
+                // 2. TOP EDGE: Left to right
                 for (int x = 0; x < CAPTURE_WIDTH; x += CAPTURE_DEPTH) {
                         int y = 0;
                         average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
                                           &g_final_buffer[buffer_index++]);
                 }
 
-                // 4. RIGHT EDGE: Top to bottom (top-right to bottom-right)
+                // 3. RIGHT EDGE: Top to bottom
                 for (int y = 0; y < CAPTURE_HEIGHT; y += CAPTURE_DEPTH) {
                         int x = CAPTURE_WIDTH - CAPTURE_DEPTH;
                         average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
                                           &g_final_buffer[buffer_index++]);
                 }
 
-                // printf("\033[2J\033[H");
-                // printf("Border samples (clockwise from bottom-right): %d\n", buffer_index);
-                // for (int i = 0; i < buffer_index; i++) {
-                //         printf("Sample %3d: RGB(%3d, %3d, %3d) ", i, g_final_buffer[i].r,
-                //                g_final_buffer[i].g, g_final_buffer[i].b);
-                //         printf("\033[48;2;%d;%d;%dm    \033[0m\n", g_final_buffer[i].r,
-                //                g_final_buffer[i].g, g_final_buffer[i].b);
-                // }
+                ssize_t result = serial_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
+
+                if (result < 0) {
+                        printf("Error\n");
+                        exit(0);
+                }
 
                 gst_buffer_unmap(buffer, &map);
         }
@@ -105,7 +99,7 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
 }
 
 static void start_gstreamer(int fd, int node) {
-        GstElement *pipewiresrc, *appsink, *videorate, *videoscale, *videoconvert;
+        GstElement *pipewiresrc, *appsink, *videorate, *videoscale, *videoconvert, *queue;
         GstCaps *caps;
         gchar *path;
 
@@ -141,11 +135,20 @@ static void start_gstreamer(int fd, int node) {
                 return;
         }
 
+        queue = gst_element_factory_make("queue", NULL);
+        if (!queue) {
+                g_printerr("Failed to create queue\n");
+                return;
+        }
+
         appsink = gst_element_factory_make("appsink", NULL);
         if (!appsink) {
                 g_printerr("Failed to create appsink\n");
                 return;
         }
+
+        g_object_set(queue, "max-size-buffers", 2, "max-size-bytes", 0, "max-size-time", 0, "leaky",
+                     2, NULL);
 
         g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop", TRUE,
                      NULL);
@@ -156,9 +159,9 @@ static void start_gstreamer(int fd, int node) {
         g_free(path);
 
         gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, videoconvert, videoscale, videorate,
-                         appsink, NULL);
+                         queue, appsink, NULL);
 
-        if (!gst_element_link_many(pipewiresrc, videoconvert, videoscale, videorate, NULL)) {
+        if (!gst_element_link_many(pipewiresrc, videoconvert, videoscale, videorate, queue, NULL)) {
                 g_printerr("Failed to link elements\n");
                 return;
         }
@@ -167,7 +170,7 @@ static void start_gstreamer(int fd, int node) {
                                    G_TYPE_INT, CAPTURE_WIDTH, "height", G_TYPE_INT, CAPTURE_HEIGHT,
                                    "framerate", GST_TYPE_FRACTION, CAPTURE_FPS, 1, NULL);
 
-        if (!gst_element_link_filtered(videorate, appsink, caps)) {
+        if (!gst_element_link_filtered(queue, appsink, caps)) {
                 g_printerr("Failed to link with caps filter\n");
                 gst_caps_unref(caps);
                 return;
@@ -227,6 +230,11 @@ static void create_session_cb(GObject *source, GAsyncResult *res, gpointer data)
 }
 
 int main() {
+        if (serial_init("/dev/ttyUSB0", 921600, 1000) == -1) {
+                printf("No Device Found\n");
+                return -1;
+        }
+
         GMainLoop *loop = g_main_loop_new(NULL, FALSE);
         XdpPortal *portal = xdp_portal_new();
 

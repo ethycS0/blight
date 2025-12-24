@@ -1,5 +1,5 @@
-#ifndef LINUX_SERIAL_WRAPPER_H
-#define LINUX_SERIAL_WRAPPER_H
+#ifndef SERIAL_WRAPPER_H
+#define SERIAL_WRAPPER_H
 
 #include <stdbool.h>
 #include <stdint.h>

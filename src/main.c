@@ -5,7 +5,11 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#if defined(SERIAL)
 #include "serial.h"
+#elif defined(WIFI)
+#include "wifi.h"
+#endif
 
 #define CAPTURE_WIDTH 256
 #define CAPTURE_HEIGHT 144
@@ -24,6 +28,8 @@ static RGB g_final_buffer[((CAPTURE_HEIGHT - CAPTURE_DEPTH) / CAPTURE_DEPTH + 1)
 
 static XdpSession *g_session;
 static GstElement *g_pipeline;
+
+static int g_brightness, g_saturation;
 
 static void average_pixel_box(const unsigned char *data, int start_x, int start_y, int box_size,
                               RGB *result) {
@@ -87,10 +93,18 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
                                           &g_final_buffer[buffer_index++]);
                 }
 
-                ssize_t result = serial_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
+                ssize_t result = 0;
+
+#if defined(SERIAL)
+                result = serial_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
+#elif defined(WIFI)
+                result = wifi_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
+#else
+#error "Define either SERIAL or WIFI"
+#endif
 
                 if (result < 0) {
-                        printf("Serial error\n");
+                        printf("Transmission error\n");
                         exit(1);
                 }
 
@@ -160,6 +174,32 @@ static void start_gstreamer(int fd, int node) {
         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
         g_print("Pipeline running\n");
 }
+static int send_config(uint8_t brightness, uint8_t saturation_boost) {
+        uint8_t config_packet[4] = {
+            0xFF,            // Magic byte
+            0xAA,            // Config identifier
+            brightness,      // 0-255
+            saturation_boost // 0-100
+        };
+
+        ssize_t result = 0;
+
+#if defined(SERIAL)
+        result = serial_tx(config_packet, sizeof(config_packet));
+#elif defined(WIFI)
+        result = wifi_tx(config_packet, sizeof(config_packet));
+#else
+#error "Define either SERIAL or WIFI"
+#endif
+
+        if (result < 0) {
+                printf("Config send failed\n");
+                return -1;
+        }
+
+        usleep(600000);
+        return 0;
+}
 
 static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) {
         XdpSession *session = XDP_SESSION(source);
@@ -186,6 +226,27 @@ static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) 
         int fd = xdp_session_open_pipewire_remote(session);
         g_print("PipeWire FD: %d\n", fd);
 
+#if defined(SERIAL)
+        if (serial_init("/dev/ttyUSB0", 921600, 1000) == -1) {
+                printf("No device found\n");
+                exit(1);
+        }
+#elif defined(WIFI)
+        if (wifi_init("192.168.1.100", 4210, 1000) == -1) {
+                printf("No device found\n");
+                exit(1);
+        }
+#else
+#error "Define either SERIAL or WIFI"
+#endif
+
+        if (send_config(g_brightness, g_saturation) == -1) {
+                printf("Failed to Send Config.");
+                exit(1);
+        }
+
+        printf("Config sent: brightness=%d, saturation=%d\n", g_brightness, g_saturation);
+
         start_gstreamer(fd, node);
 }
 
@@ -206,46 +267,17 @@ static void create_session_cb(GObject *source, GAsyncResult *res, gpointer data)
         xdp_session_start(session, NULL, NULL, start_session_cb, NULL);
 }
 
-static int send_config(uint8_t brightness, uint8_t saturation_boost) {
-        uint8_t config_packet[4] = {
-            0xFF,            // Magic byte
-            0xAA,            // Config identifier
-            brightness,      // 0-255
-            saturation_boost // 0-100
-        };
-
-        ssize_t result = serial_tx(config_packet, sizeof(config_packet));
-        if (result < 0) {
-                printf("Config send failed\n");
-                return -1;
-        }
-
-        usleep(600000);
-        return 0;
-}
-
 int main(int argc, const char *argv[]) {
-        uint8_t brightness = BRIGHTNESS;
-        uint8_t saturation = SATURATION;
+        g_brightness = BRIGHTNESS;
+        g_saturation = SATURATION;
 
         if (argc >= 2) {
-                brightness = atoi(argv[1]);
+                g_brightness = atoi(argv[1]);
         }
 
         if (argc >= 3) {
-                saturation = atoi(argv[2]);
+                g_saturation = atoi(argv[2]);
         }
-
-        if (serial_init("/dev/ttyUSB0", 921600, 1000) == -1) {
-                printf("No device found\n");
-                return -1;
-        }
-
-        if (send_config(brightness, saturation) == -1) {
-                return -1;
-        }
-
-        printf("Config sent: brightness=%d, saturation=%d\n", brightness, saturation);
 
         GMainLoop *loop = g_main_loop_new(NULL, FALSE);
         XdpPortal *portal = xdp_portal_new();

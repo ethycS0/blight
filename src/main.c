@@ -233,7 +233,12 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
 }
 
 static void start_gstreamer(int fd, int node) {
-        GstElement *pipewiresrc, *appsink, *videorate, *videoscale, *videoconvert, *queue;
+        GstElement *pipewiresrc, *appsink, *videorate, *queue;
+#ifdef USE_GPU
+        GstElement *vaapipostproc, *videoconvert;
+#else
+        GstElement *videoscale, *videoconvert;
+#endif
         GstCaps *caps;
         gchar *path;
 
@@ -246,20 +251,35 @@ static void start_gstreamer(int fd, int node) {
         }
 
         pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
-        videoconvert = gst_element_factory_make("videoconvert", NULL);
-        videoscale = gst_element_factory_make("videoscale", NULL);
         videorate = gst_element_factory_make("videorate", NULL);
         queue = gst_element_factory_make("queue", NULL);
         appsink = gst_element_factory_make("appsink", NULL);
+
+#ifdef USE_GPU
+        vaapipostproc = gst_element_factory_make("vaapipostproc", NULL);
+        videoconvert = gst_element_factory_make("videoconvert", NULL);
+
+        if (!pipewiresrc || !vaapipostproc || !videoconvert || !videorate || !queue || !appsink) {
+                g_printerr("Failed to create elements (check VA-API support)\n");
+                return;
+        }
+
+        g_object_set(vaapipostproc, "width", CAPTURE_WIDTH, "height", CAPTURE_HEIGHT, NULL);
+#else
+        videoconvert = gst_element_factory_make("videoconvert", NULL);
+        videoscale = gst_element_factory_make("videoscale", NULL);
 
         if (!pipewiresrc || !videoconvert || !videoscale || !videorate || !queue || !appsink) {
                 g_printerr("Failed to create elements\n");
                 return;
         }
+#endif
 
-        g_object_set(pipewiresrc, "always-copy", TRUE, "keepalive-time", 1000, NULL);
+        g_object_set(pipewiresrc, "always-copy", FALSE, "keepalive-time", 1000, NULL);
 
-        g_object_set(queue, "max-size-buffers", 2, "max-size-bytes", 0, "max-size-time", 0, "leaky",
+        g_object_set(videorate, "skip-to-first", TRUE, "drop-only", TRUE, NULL);
+
+        g_object_set(queue, "max-size-buffers", 1, "max-size-bytes", 0, "max-size-time", 0, "leaky",
                      2, NULL);
 
         g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop", TRUE,
@@ -270,6 +290,16 @@ static void start_gstreamer(int fd, int node) {
         g_object_set(pipewiresrc, "fd", fd, "path", path, NULL);
         g_free(path);
 
+#ifdef USE_GPU
+        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, vaapipostproc, videoconvert, videorate,
+                         queue, appsink, NULL);
+
+        if (!gst_element_link_many(pipewiresrc, vaapipostproc, videoconvert, videorate, queue,
+                                   NULL)) {
+                g_printerr("Failed to link elements\n");
+                return;
+        }
+#else
         gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, videoconvert, videoscale, videorate,
                          queue, appsink, NULL);
 
@@ -277,6 +307,7 @@ static void start_gstreamer(int fd, int node) {
                 g_printerr("Failed to link elements\n");
                 return;
         }
+#endif
 
         caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "RGB", "width",
                                    G_TYPE_INT, CAPTURE_WIDTH, "height", G_TYPE_INT, CAPTURE_HEIGHT,
@@ -293,6 +324,7 @@ static void start_gstreamer(int fd, int node) {
         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
         g_print("Pipeline running\n");
 }
+
 static int send_config(uint8_t brightness) {
         uint8_t config_packet[4] = {
             0xFF,      // Magic byte

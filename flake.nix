@@ -15,59 +15,54 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+
+        mkBlight =
+          useWifi:
+          pkgs.stdenv.mkDerivation {
+            pname = "blight";
+            version = "0.1.0";
+            src = ./.;
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              gcc
+              makeWrapper
+            ];
+
+            buildInputs = with pkgs; [
+              gst_all_1.gstreamer
+              gst_all_1.gst-plugins-base
+              gst_all_1.gst-plugins-good
+              gst_all_1.gst-plugins-bad
+              pipewire
+              glib
+              libportal
+            ];
+
+            buildPhase = ''
+              gcc ${if useWifi then "-DWIFI" else "-DSERIAL"} -o main src/main.c src/serial.c ${
+                if useWifi then "src/wifi.c" else ""
+              } \
+                $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 libportal glib-2.0) \
+                -lm
+            '';
+
+            installPhase = ''
+              mkdir -p $out/bin
+              cp main $out/bin/blight
+            '';
+
+            postFixup = ''
+              wrapProgram $out/bin/blight \
+                --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "$GST_PLUGIN_SYSTEM_PATH_1_0"
+            '';
+          };
       in
       {
-        packages.default = pkgs.stdenv.mkDerivation {
-          pname = "blight";
-          version = "0.1.0";
-          src = ./.;
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-            gcc
-            makeWrapper
-          ];
-
-          buildInputs = with pkgs; [
-            gst_all_1.gstreamer
-            gst_all_1.gst-plugins-base
-            gst_all_1.gst-plugins-good
-            gst_all_1.gst-plugins-bad
-            pipewire
-            glib
-            libportal
-          ];
-
-          buildPhase = ''
-            gcc -o main src/main.c src/serial.c \
-              $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 libportal glib-2.0)
-          '';
-
-          installPhase = ''
-            mkdir -p $out/bin
-            cp main $out/bin/blight
-
-            mkdir -p $out/share/systemd/user
-            cat > $out/share/systemd/user/blight.service <<EOF
-            [Unit]
-            Description=Bias Lighting for Monitor
-            After=graphical-session.target pipewire.service
-
-            [Service]
-            Type=simple
-            ExecStart=$out/bin/blight 120 1
-            Restart=on-failure
-            RestartSec=5
-
-            [Install]
-            WantedBy=graphical-session.target
-            EOF
-          '';
-
-          postFixup = ''
-            wrapProgram $out/bin/blight \
-              --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "$GST_PLUGIN_SYSTEM_PATH_1_0"
-          '';
+        packages = {
+          default = mkBlight false;
+          blight_serial = mkBlight false;
+          blight_wifi = mkBlight true;
         };
 
         devShells.default = pkgs.mkShell {

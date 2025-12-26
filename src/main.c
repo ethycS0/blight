@@ -2,6 +2,7 @@
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <libportal/portal.h>
+#include <math.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -14,13 +15,15 @@
 #define CAPTURE_WIDTH 256
 #define CAPTURE_HEIGHT 144
 #define CAPTURE_DEPTH 10
-#define CAPTURE_FPS 24
-#define BRIGHTNESS 120
-#define SATURATION 1
+#define CAPTURE_FPS 60
 
 typedef struct {
         unsigned char r, g, b;
 } RGB;
+
+typedef struct {
+        float r, g, b;
+} ColorFloat;
 
 static RGB g_final_buffer[((CAPTURE_HEIGHT - CAPTURE_DEPTH) / CAPTURE_DEPTH + 1) +
                           ((CAPTURE_WIDTH + CAPTURE_DEPTH - 1) / CAPTURE_DEPTH) +
@@ -29,7 +32,116 @@ static RGB g_final_buffer[((CAPTURE_HEIGHT - CAPTURE_DEPTH) / CAPTURE_DEPTH + 1)
 static XdpSession *g_session;
 static GstElement *g_pipeline;
 
-static int g_brightness, g_saturation;
+static ColorFloat *smoothed_colors = NULL;
+
+static int g_brightness = 150;
+static float g_saturation = 1;
+static float g_smoothing = 1;
+
+static void apply_smoothing_filter(uint8_t *colors, int num_leds) {
+        if (smoothed_colors == NULL) {
+                smoothed_colors = calloc(num_leds, sizeof(ColorFloat));
+                for (int i = 0; i < num_leds; i++) {
+                        smoothed_colors[i].r = colors[i * 3];
+                        smoothed_colors[i].g = colors[i * 3 + 1];
+                        smoothed_colors[i].b = colors[i * 3 + 2];
+                }
+                return;
+        }
+
+        for (int i = 0; i < num_leds; i++) {
+                smoothed_colors[i].r =
+                    g_smoothing * colors[i * 3] + (1.0f - g_smoothing) * smoothed_colors[i].r;
+                smoothed_colors[i].g =
+                    g_smoothing * colors[i * 3 + 1] + (1.0f - g_smoothing) * smoothed_colors[i].g;
+                smoothed_colors[i].b =
+                    g_smoothing * colors[i * 3 + 2] + (1.0f - g_smoothing) * smoothed_colors[i].b;
+
+                colors[i * 3] = (uint8_t)(smoothed_colors[i].r + 0.5f);
+                colors[i * 3 + 1] = (uint8_t)(smoothed_colors[i].g + 0.5f);
+                colors[i * 3 + 2] = (uint8_t)(smoothed_colors[i].b + 0.5f);
+        }
+}
+
+static void boost_saturation(RGB *color, float boost) {
+        if (boost <= 1.0f)
+                return;
+
+        float r = color->r / 255.0f;
+        float g = color->g / 255.0f;
+        float b = color->b / 255.0f;
+
+        float max = fmaxf(r, fmaxf(g, b));
+        float min = fminf(r, fminf(g, b));
+        float delta = max - min;
+
+        if (delta < 0.001f) {
+                return;
+        }
+
+        float h, s, v = max;
+        s = delta / max;
+
+        if (r == max)
+                h = (g - b) / delta + (g < b ? 6.0f : 0.0f);
+        else if (g == max)
+                h = (b - r) / delta + 2.0f;
+        else
+                h = (r - g) / delta + 4.0f;
+        h /= 6.0f;
+
+        s = fminf(s * boost, 1.0f);
+
+        int i = (int)(h * 6.0f);
+        float f = h * 6.0f - i;
+        float p = v * (1.0f - s);
+        float q = v * (1.0f - f * s);
+        float t = v * (1.0f - (1.0f - f) * s);
+
+        switch (i % 6) {
+        case 0:
+                r = v;
+                g = t;
+                b = p;
+                break;
+        case 1:
+                r = q;
+                g = v;
+                b = p;
+                break;
+        case 2:
+                r = p;
+                g = v;
+                b = t;
+                break;
+        case 3:
+                r = p;
+                g = q;
+                b = v;
+                break;
+        case 4:
+                r = t;
+                g = p;
+                b = v;
+                break;
+        case 5:
+                r = v;
+                g = p;
+                b = q;
+                break;
+        }
+
+        color->r = (unsigned char)(r * 255.0f);
+        color->g = (unsigned char)(g * 255.0f);
+        color->b = (unsigned char)(b * 255.0f);
+}
+
+static void cleanup_smoothing() {
+        if (smoothed_colors != NULL) {
+                free(smoothed_colors);
+                smoothed_colors = NULL;
+        }
+}
 
 static void average_pixel_box(const unsigned char *data, int start_x, int start_y, int box_size,
                               RGB *result) {
@@ -54,6 +166,8 @@ static void average_pixel_box(const unsigned char *data, int start_x, int start_
         result->r = count > 0 ? total_r / count : 0;
         result->g = count > 0 ? total_g / count : 0;
         result->b = count > 0 ? total_b / count : 0;
+
+        boost_saturation(result, g_saturation);
 }
 
 static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
@@ -92,6 +206,9 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
                         average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
                                           &g_final_buffer[buffer_index++]);
                 }
+
+                int num_leds = sizeof(g_final_buffer) / sizeof(RGB);
+                apply_smoothing_filter((uint8_t *)g_final_buffer, num_leds);
 
                 ssize_t result = 0;
 
@@ -140,6 +257,8 @@ static void start_gstreamer(int fd, int node) {
                 return;
         }
 
+        g_object_set(pipewiresrc, "always-copy", TRUE, "keepalive-time", 1000, NULL);
+
         g_object_set(queue, "max-size-buffers", 2, "max-size-bytes", 0, "max-size-time", 0, "leaky",
                      2, NULL);
 
@@ -174,12 +293,11 @@ static void start_gstreamer(int fd, int node) {
         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
         g_print("Pipeline running\n");
 }
-static int send_config(uint8_t brightness, uint8_t saturation_boost) {
+static int send_config(uint8_t brightness) {
         uint8_t config_packet[4] = {
-            0xFF,            // Magic byte
-            0xAA,            // Config identifier
-            brightness,      // 0-255
-            saturation_boost // 0-100
+            0xFF,      // Magic byte
+            0xAA,      // Config identifier
+            brightness // 0-255
         };
 
         ssize_t result = 0;
@@ -240,12 +358,12 @@ static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) 
 #error "Define either SERIAL or WIFI"
 #endif
 
-        if (send_config(g_brightness, g_saturation) == -1) {
+        if (send_config(g_brightness) == -1) {
                 printf("Failed to Send Config.");
                 exit(1);
         }
 
-        printf("Config sent: brightness=%d, saturation=%d\n", g_brightness, g_saturation);
+        printf("Config sent: brightness=%d\n", g_brightness);
 
         start_gstreamer(fd, node);
 }
@@ -268,15 +386,20 @@ static void create_session_cb(GObject *source, GAsyncResult *res, gpointer data)
 }
 
 int main(int argc, const char *argv[]) {
-        g_brightness = BRIGHTNESS;
-        g_saturation = SATURATION;
-
         if (argc >= 2) {
                 g_brightness = atoi(argv[1]);
         }
 
         if (argc >= 3) {
-                g_saturation = atoi(argv[2]);
+                g_saturation = atof(argv[2]);
+        }
+
+        if (argc >= 4) {
+                g_smoothing = atof(argv[3]);
+                if (g_smoothing < 0.1f)
+                        g_smoothing = 0.1f;
+                if (g_smoothing > 1.0f)
+                        g_smoothing = 1.0f;
         }
 
         GMainLoop *loop = g_main_loop_new(NULL, FALSE);
@@ -287,5 +410,7 @@ int main(int argc, const char *argv[]) {
                                              NULL, NULL, create_session_cb, NULL);
 
         g_main_loop_run(loop);
+        cleanup_smoothing();
+
         return 0;
 }

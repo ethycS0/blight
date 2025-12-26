@@ -1,10 +1,12 @@
 #include <FastLED.h>
 
 #define WIFI
+// #define SERIAL
 
 #ifdef WIFI
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_wifi.h>
 #endif
 
 #define DATA_PIN 14
@@ -51,12 +53,9 @@ WiFiUDP udp;
 enum SystemState { STATE_WAITING_CONFIG, STATE_ACTIVE, STATE_TIMEOUT };
 
 CRGB leds[NUM_LEDS];
-CRGB targetColors[NUM_LEDS];
 uint8_t rxBuffer[BUFFER_SIZE];
 
 uint8_t g_brightness = 150;
-uint8_t g_saturation_boost = 1;
-uint8_t g_smoothing = 100;
 
 unsigned long lastFrameTime = 0;
 SystemState currentState = STATE_WAITING_CONFIG;
@@ -66,7 +65,11 @@ void startupBlink() {
         bool ledState = true;
 
         while (millis() - startTime < STARTUP_BLINK_DURATION) {
-                fill_solid(leds, NUM_LEDS, CRGB(73, 16, 230));
+                if (ledState) {
+                        fill_solid(leds, NUM_LEDS, CRGB(73, 16, 230));
+                } else {
+                        FastLED.clear();
+                }
                 FastLED.show();
                 ledState = !ledState;
                 delay(200);
@@ -77,14 +80,13 @@ void startupBlink() {
 }
 
 bool processConfigPacket(uint8_t *buffer, size_t size) {
-        if (size >= 4 && buffer[0] == 0xFF && buffer[1] == 0xAA) {
+        if (size == 4 && buffer[0] == 0xFF && buffer[1] == 0xAA) {
                 g_brightness = buffer[2];
-                g_saturation_boost = buffer[3];
                 FastLED.setBrightness(g_brightness);
 
                 fill_solid(leds, NUM_LEDS, CRGB::Green);
                 FastLED.show();
-                delay(1000);
+                delay(100);
                 FastLED.clear();
                 FastLED.show();
 
@@ -125,6 +127,7 @@ void waitForConfig() {
                         }
                 }
 
+                yield();
                 delay(10);
         }
 }
@@ -144,6 +147,19 @@ void enterTimeoutState() {
         }
 }
 
+#ifdef WIFI
+void optimizeWiFi() {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+        esp_wifi_set_max_tx_power(84);
+        wifi_config_t conf;
+        esp_wifi_get_config(WIFI_IF_STA, &conf);
+        conf.sta.listen_interval = 1;
+        esp_wifi_set_config(WIFI_IF_STA, &conf);
+        Serial.println("WiFi optimized for low latency");
+}
+#endif
+
 void setup() {
 #ifdef SERIAL
         Serial.begin(SERIAL_BAUD);
@@ -155,6 +171,8 @@ void setup() {
 
 #ifdef WIFI
         Serial.begin(115200);
+
+        WiFi.setSleep(false);
 
         if (!WiFi.config(staticIP, gateway, subnet, primaryDNS, secondaryDNS)) {
                 Serial.println("Static IP configuration failed!");
@@ -174,11 +192,14 @@ void setup() {
                 Serial.println("\nWiFi connected");
                 Serial.print("IP: ");
                 Serial.println(WiFi.localIP());
+
+                optimizeWiFi();
         } else {
                 Serial.println("\nWiFi connection failed!");
         }
 
         udp.begin(UDP_PORT);
+
         Serial.printf("UDP listening on port %d\n", UDP_PORT);
 #endif
 
@@ -191,7 +212,6 @@ void setup() {
 }
 
 void loop() {
-        // Check for timeout
         if (currentState == STATE_ACTIVE && millis() - lastFrameTime > TIMEOUT_MS) {
                 enterTimeoutState();
                 return;
@@ -199,6 +219,26 @@ void loop() {
 
         bool dataAvailable = false;
         size_t bytesRead = 0;
+
+#ifdef WIFI
+        int packetSize = udp.parsePacket();
+        if (packetSize >= BUFFER_SIZE) {
+                bytesRead = udp.read(rxBuffer, BUFFER_SIZE);
+                dataAvailable = (bytesRead == BUFFER_SIZE);
+        } else if (packetSize >= 4) {
+                uint8_t tempBuf[4];
+                bytesRead = udp.read(tempBuf, 4);
+                if (processConfigPacket(tempBuf, bytesRead)) {
+                        lastFrameTime = millis();
+                        if (currentState != STATE_ACTIVE) {
+                                currentState = STATE_ACTIVE;
+                        }
+                        return;
+                }
+        } else if (packetSize > 0) {
+                udp.flush();
+        }
+#endif
 
 #ifdef SERIAL
         if (Serial.available() >= BUFFER_SIZE) {
@@ -209,16 +249,6 @@ void loop() {
                         while (Serial.available())
                                 Serial.read();
                 }
-        }
-#endif
-
-#ifdef WIFI
-        int packetSize = udp.parsePacket();
-        if (packetSize >= BUFFER_SIZE) {
-                bytesRead = udp.read(rxBuffer, BUFFER_SIZE);
-                dataAvailable = (bytesRead == BUFFER_SIZE);
-        } else if (packetSize > 0 && packetSize < BUFFER_SIZE) {
-                udp.flush();
         }
 #endif
 
@@ -240,22 +270,8 @@ void loop() {
                         srcIndex = constrain(srcIndex, 0, RECEIVED_LEDS - 1);
                         int offset = srcIndex * 3;
 
-                        CRGB color =
+                        leds[i] =
                             CRGB(rxBuffer[offset + 0], rxBuffer[offset + 1], rxBuffer[offset + 2]);
-
-                        CHSV hsv = rgb2hsv_approximate(color);
-
-                        if (g_saturation_boost > 0) {
-                                uint16_t sat_range = 255 - hsv.s;
-                                uint16_t sat_increase = (sat_range * g_saturation_boost) / 255;
-                                hsv.s = constrain(hsv.s + sat_increase, 0, 255);
-                        }
-
-                        targetColors[i] = hsv;
-                }
-
-                for (int i = 0; i < NUM_LEDS; i++) {
-                        leds[i] = blend(leds[i], targetColors[i], g_smoothing);
                 }
 
                 FastLED.show();
@@ -268,5 +284,5 @@ void loop() {
 #endif
         }
 
-        delay(1);
+        yield();
 }

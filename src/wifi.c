@@ -9,8 +9,7 @@
 static int g_sockfd = -1;
 static struct sockaddr_in g_esp_addr;
 
-// mDNS discovery helper
-static int resolve_mdns(const char *hostname, char *ip_out, size_t ip_len) {
+static int resolve_dns(const char *hostname, char *ip_out, size_t ip_len) {
         struct addrinfo hints, *result, *rp;
 
         memset(&hints, 0, sizeof(hints));
@@ -19,7 +18,7 @@ static int resolve_mdns(const char *hostname, char *ip_out, size_t ip_len) {
 
         int s = getaddrinfo(hostname, NULL, &hints, &result);
         if (s != 0) {
-                fprintf(stderr, "mDNS lookup failed: %s\n", gai_strerror(s));
+                fprintf(stderr, "DNS lookup failed: %s\n", gai_strerror(s));
                 return -1;
         }
 
@@ -37,8 +36,7 @@ static int resolve_mdns(const char *hostname, char *ip_out, size_t ip_len) {
 int wifi_init(const char *esp_hostname, uint16_t port, int timeout_ms) {
         char esp_ip[INET_ADDRSTRLEN];
 
-        // Try mDNS resolution (e.g., "esp32-bias.local")
-        if (resolve_mdns(esp_hostname, esp_ip, sizeof(esp_ip)) == -1) {
+        if (resolve_dns(esp_hostname, esp_ip, sizeof(esp_ip)) == -1) {
                 fprintf(stderr, "Failed to resolve %s via mDNS\n", esp_hostname);
                 return -1;
         }
@@ -51,7 +49,6 @@ int wifi_init(const char *esp_hostname, uint16_t port, int timeout_ms) {
                 return -1;
         }
 
-        // Set socket timeout
         struct timeval tv;
         tv.tv_sec = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;

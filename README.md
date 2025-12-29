@@ -60,4 +60,20 @@ nix develop
 
 CPU usage is minimal, but active PipeWire screencast causes GPU sync points on GNOME/Mutter, leading to 7-10% FPS drop in intensive games. This is a compositor limitation. KDE Plasma handles this better, or disable when gaming.
 
+## TODO
+
+- [ ] **Daemon + Control Tool**: Implement `blightd` daemon with `blightctl` for runtime control
+  - Start/stop capture without restarting
+  - Adjust brightness/saturation/smoothing on the fly
+  - Unix socket IPC for low overhead
+- [ ] **XDG Portal Token Restoration**: Save authorization token for persistent permissions
+  - No permission dialog on every startup
+  - Store in `~/.config/blight/portal_token`
+  - Requires portal protocol v4+ (xdg-desktop-portal ≥1.12.1)
+- [ ] **Black Boundary Detection**: Skip black bars for different aspect ratios
+  - Auto-detect letterboxing (21:9 content on 16:9 display)
+  - Auto-detect pillarboxing (4:3 content on 16:9 display)
+  - Sample only actual video content, ignore black borders
+  - Better color accuracy for non-native aspect ratio content
+
 ---

@@ -38,13 +38,14 @@
               gst_all_1.gst-plugins-good
               gst_all_1.gst-plugins-bad
               gst_all_1.gst-vaapi
+              libglvnd
               pipewire
               glib
               libportal
             ];
 
             buildPhase = ''
-              gcc ${if useWifi then "-DWIFI" else "-DSERIAL"} ${if useGpu then "-DUSE_GPU" else ""} \
+              gcc ${if useWifi then "-DWIFI" else "-DSERIAL"} ${if useGpu then "-DUSE_GPU" else ""} -g -O2 \
                 -o main src/main.c src/serial.c ${if useWifi then "src/wifi.c" else ""} \
                 $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 libportal glib-2.0) \
                 -lm
@@ -94,6 +95,7 @@
             pipewire
             glib
             libportal
+            perf
           ];
 
           shellHook = ''

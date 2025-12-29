@@ -11,13 +11,13 @@
 
 #define DATA_PIN 14
 #define NUM_LEDS 62
+#define CAPTURE_WIDTH 160
+#define CAPTURE_HEIGHT 90
+#define CAPTURE_DEPTH 10
 #define RECEIVED_LEDS                                                                              \
         ((CAPTURE_HEIGHT - CAPTURE_DEPTH) / CAPTURE_DEPTH + 1 +                                    \
          (CAPTURE_WIDTH + CAPTURE_DEPTH - 1) / CAPTURE_DEPTH +                                     \
          (CAPTURE_HEIGHT + CAPTURE_DEPTH - 1) / CAPTURE_DEPTH)
-#define CAPTURE_WIDTH 256
-#define CAPTURE_HEIGHT 144
-#define CAPTURE_DEPTH 10
 
 #ifdef SERIAL
 #define SERIAL_BAUD 921600

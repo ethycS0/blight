@@ -12,10 +12,10 @@
 #include "wifi.h"
 #endif
 
-#define CAPTURE_WIDTH 256
-#define CAPTURE_HEIGHT 144
+#define CAPTURE_WIDTH 160
+#define CAPTURE_HEIGHT 90
 #define CAPTURE_DEPTH 10
-#define CAPTURE_FPS 60
+#define CAPTURE_FPS 24
 
 typedef struct {
         unsigned char r, g, b;
@@ -145,27 +145,25 @@ static void cleanup_smoothing() {
 
 static void average_pixel_box(const unsigned char *data, int start_x, int start_y, int box_size,
                               RGB *result) {
-        int total_r = 0, total_g = 0, total_b = 0;
-        int count = 0;
+        unsigned int total_r = 0, total_g = 0, total_b = 0;
+        const int stride = CAPTURE_WIDTH * 4;
+
+        const unsigned char *base = data + (start_y * stride) + (start_x * 4);
 
         for (int dy = 0; dy < box_size; dy++) {
+                const unsigned char *row = base + (dy * stride);
                 for (int dx = 0; dx < box_size; dx++) {
-                        int x = start_x + dx;
-                        int y = start_y + dy;
-
-                        if (x >= 0 && x < CAPTURE_WIDTH && y >= 0 && y < CAPTURE_HEIGHT) {
-                                int offset = (y * CAPTURE_WIDTH + x) * 3;
-                                total_r += data[offset + 0];
-                                total_g += data[offset + 1];
-                                total_b += data[offset + 2];
-                                count++;
-                        }
+                        total_b += row[0];
+                        total_g += row[1];
+                        total_r += row[2];
+                        row += 4;
                 }
         }
 
-        result->r = count > 0 ? total_r / count : 0;
-        result->g = count > 0 ? total_g / count : 0;
-        result->b = count > 0 ? total_b / count : 0;
+        int count = box_size * box_size;
+        result->r = total_r / count;
+        result->g = total_g / count;
+        result->b = total_b / count;
 
         boost_saturation(result, g_saturation);
 }
@@ -232,14 +230,57 @@ static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
         return GST_FLOW_OK;
 }
 
+// static void start_gstreamer(int fd, int node) {
+//         GstElement *pipewiresrc, *appsink, *queue;
+//         GstCaps *caps;
+//         gchar *path;
+//
+//         gst_init(NULL, NULL);
+//
+//         g_pipeline = gst_pipeline_new("capture");
+//         if (!g_pipeline) {
+//                 g_printerr("Failed to create pipeline\n");
+//                 return;
+//         }
+//
+//         pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
+//         queue = gst_element_factory_make("queue", NULL);
+//         appsink = gst_element_factory_make("appsink", NULL);
+//
+//         if (!pipewiresrc || !queue || !appsink) {
+//                 g_printerr("Failed to create elements\n");
+//                 return;
+//         }
+//
+//         path = g_strdup_printf("%u", node);
+//         g_object_set(pipewiresrc, "fd", fd, "path", path, "always-copy", FALSE, NULL);
+//         g_free(path);
+//
+//         g_object_set(queue, "max-size-buffers", 1, "leaky", 2, NULL);
+//
+//         caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx", NULL);
+//
+//         g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop",
+//         TRUE,
+//                      "caps", caps, NULL);
+//         gst_caps_unref(caps);
+//
+//         g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), NULL);
+//
+//         gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, queue, appsink, NULL);
+//
+//         if (!gst_element_link_many(pipewiresrc, queue, appsink, NULL)) {
+//                 g_printerr("Failed to link elements\n");
+//                 return;
+//         }
+//
+//         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
+//         g_print("Pipeline running\n");
+// }
+
 static void start_gstreamer(int fd, int node) {
-        GstElement *pipewiresrc, *appsink, *videorate, *queue;
-#ifdef USE_GPU
-        GstElement *vaapipostproc, *videoconvert;
-#else
-        GstElement *videoscale, *videoconvert;
-#endif
-        GstCaps *caps;
+        GstElement *pipewiresrc, *appsink, *videorate, *queue, *videoconvertscale, *fps_filter;
+        GstCaps *caps, *fps_caps;
         gchar *path;
 
         gst_init(NULL, NULL);
@@ -252,68 +293,47 @@ static void start_gstreamer(int fd, int node) {
 
         pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
         videorate = gst_element_factory_make("videorate", NULL);
+        fps_filter = gst_element_factory_make("capsfilter", "fps_filter");
+        videoconvertscale = gst_element_factory_make("videoconvertscale", NULL);
         queue = gst_element_factory_make("queue", NULL);
         appsink = gst_element_factory_make("appsink", NULL);
 
-#ifdef USE_GPU
-        vaapipostproc = gst_element_factory_make("vaapipostproc", NULL);
-        videoconvert = gst_element_factory_make("videoconvert", NULL);
-
-        if (!pipewiresrc || !vaapipostproc || !videoconvert || !videorate || !queue || !appsink) {
-                g_printerr("Failed to create elements (check VA-API support)\n");
-                return;
-        }
-
-        g_object_set(vaapipostproc, "width", CAPTURE_WIDTH, "height", CAPTURE_HEIGHT, NULL);
-#else
-        videoconvert = gst_element_factory_make("videoconvert", NULL);
-        videoscale = gst_element_factory_make("videoscale", NULL);
-
-        if (!pipewiresrc || !videoconvert || !videoscale || !videorate || !queue || !appsink) {
+        if (!pipewiresrc || !videoconvertscale || !videorate || !queue || !appsink || !fps_filter) {
                 g_printerr("Failed to create elements\n");
                 return;
         }
-#endif
 
-        g_object_set(pipewiresrc, "always-copy", FALSE, "keepalive-time", 1000, NULL);
+        path = g_strdup_printf("%u", node);
+        g_object_set(pipewiresrc, "fd", fd, "path", path, "always-copy", FALSE, NULL);
+        g_free(path);
 
         g_object_set(videorate, "skip-to-first", TRUE, "drop-only", TRUE, NULL);
+        fps_caps = gst_caps_new_simple("video/x-raw", "framerate", GST_TYPE_FRACTION, CAPTURE_FPS,
+                                       1, NULL);
+        g_object_set(fps_filter, "caps", fps_caps, NULL);
+        gst_caps_unref(fps_caps);
 
         g_object_set(queue, "max-size-buffers", 1, "max-size-bytes", 0, "max-size-time", 0, "leaky",
                      2, NULL);
-
+        g_object_set(videoconvertscale, "n-threads", 0, "dither", 0, "method", 0, NULL);
         g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop", TRUE,
                      NULL);
         g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), NULL);
 
-        path = g_strdup_printf("%u", node);
-        g_object_set(pipewiresrc, "fd", fd, "path", path, NULL);
-        g_free(path);
+        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, queue, videorate, fps_filter,
+                         videoconvertscale, appsink, NULL);
 
-#ifdef USE_GPU
-        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, vaapipostproc, videoconvert, videorate,
-                         queue, appsink, NULL);
-
-        if (!gst_element_link_many(pipewiresrc, vaapipostproc, videoconvert, videorate, queue,
+        if (!gst_element_link_many(pipewiresrc, queue, videorate, fps_filter, videoconvertscale,
                                    NULL)) {
                 g_printerr("Failed to link elements\n");
                 return;
         }
-#else
-        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, videoconvert, videoscale, videorate,
-                         queue, appsink, NULL);
 
-        if (!gst_element_link_many(pipewiresrc, videoconvert, videoscale, videorate, queue, NULL)) {
-                g_printerr("Failed to link elements\n");
-                return;
-        }
-#endif
+        caps =
+            gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx", "width", G_TYPE_INT,
+                                CAPTURE_WIDTH, "height", G_TYPE_INT, CAPTURE_HEIGHT, NULL);
 
-        caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "RGB", "width",
-                                   G_TYPE_INT, CAPTURE_WIDTH, "height", G_TYPE_INT, CAPTURE_HEIGHT,
-                                   "framerate", GST_TYPE_FRACTION, CAPTURE_FPS, 1, NULL);
-
-        if (!gst_element_link_filtered(queue, appsink, caps)) {
+        if (!gst_element_link_filtered(videoconvertscale, appsink, caps)) {
                 g_printerr("Failed to link with caps filter\n");
                 gst_caps_unref(caps);
                 return;
@@ -438,7 +458,7 @@ int main(int argc, const char *argv[]) {
         XdpPortal *portal = xdp_portal_new();
 
         xdp_portal_create_screencast_session(portal, XDP_OUTPUT_MONITOR, XDP_SCREENCAST_FLAG_NONE,
-                                             XDP_CURSOR_MODE_EMBEDDED, XDP_PERSIST_MODE_TRANSIENT,
+                                             XDP_CURSOR_MODE_HIDDEN, XDP_PERSIST_MODE_TRANSIENT,
                                              NULL, NULL, create_session_cb, NULL);
 
         g_main_loop_run(loop);

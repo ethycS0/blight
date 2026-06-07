@@ -56,6 +56,15 @@ CRGB leds[NUM_LEDS];
 uint8_t rxBuffer[BUFFER_SIZE];
 
 uint8_t g_brightness = 150;
+float g_saturation = 1.0f;
+float g_smoothing = 1.0f;
+
+struct ColorFloat {
+        float r, g, b;
+};
+
+ColorFloat smoothed_colors[NUM_LEDS];
+bool first_frame = true;
 
 unsigned long lastFrameTime = 0;
 SystemState currentState = STATE_WAITING_CONFIG;
@@ -79,10 +88,53 @@ void startupBlink() {
         FastLED.show();
 }
 
+void boost_saturation_f(float &r, float &g, float &b, float boost) {
+        if (boost <= 1.0f) return;
+
+        float max_val = max(r, max(g, b));
+        float min_val = min(r, min(g, b));
+        float delta = max_val - min_val;
+
+        if (delta < 0.001f) return;
+
+        float h, s, v = max_val;
+        s = delta / max_val;
+
+        if (r == max_val)
+                h = (g - b) / delta + (g < b ? 6.0f : 0.0f);
+        else if (g == max_val)
+                h = (b - r) / delta + 2.0f;
+        else
+                h = (r - g) / delta + 4.0f;
+        h /= 6.0f;
+
+        s = min(s * boost, 1.0f);
+
+        int i = (int)(h * 6.0f);
+        float f = h * 6.0f - i;
+        float p = v * (1.0f - s);
+        float q = v * (1.0f - f * s);
+        float t = v * (1.0f - (1.0f - f) * s);
+
+        switch (i % 6) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        case 5: r = v; g = p; b = q; break;
+        }
+}
+
 bool processConfigPacket(uint8_t *buffer, size_t size) {
-        if (size == 4 && buffer[0] == 0xFF && buffer[1] == 0xAA) {
+        if (size >= 4 && buffer[0] == 0xFF && buffer[1] == 0xAA) {
                 g_brightness = buffer[2];
                 FastLED.setBrightness(g_brightness);
+                
+                if (size >= 12) {
+                        memcpy(&g_saturation, &buffer[4], sizeof(float));
+                        memcpy(&g_smoothing, &buffer[8], sizeof(float));
+                }
 
                 fill_solid(leds, NUM_LEDS, CRGB::Green);
                 FastLED.show();
@@ -96,7 +148,7 @@ bool processConfigPacket(uint8_t *buffer, size_t size) {
 }
 
 void waitForConfig() {
-        uint8_t configBuffer[4];
+        uint8_t configBuffer[12];
 
         currentState = STATE_WAITING_CONFIG;
 
@@ -105,7 +157,10 @@ void waitForConfig() {
                 size_t bytesRead = 0;
 
 #ifdef SERIAL
-                if (Serial.available() >= 4) {
+                if (Serial.available() >= 12) {
+                        bytesRead = Serial.readBytes(configBuffer, 12);
+                        hasData = (bytesRead == 12);
+                } else if (Serial.available() >= 4) {
                         bytesRead = Serial.readBytes(configBuffer, 4);
                         hasData = (bytesRead == 4);
                 }
@@ -114,7 +169,7 @@ void waitForConfig() {
 #ifdef WIFI
                 int packetSize = udp.parsePacket();
                 if (packetSize >= 4) {
-                        bytesRead = udp.read(configBuffer, 4);
+                        bytesRead = udp.read(configBuffer, sizeof(configBuffer));
                         hasData = (bytesRead >= 4);
                 }
 #endif
@@ -226,8 +281,8 @@ void loop() {
                 bytesRead = udp.read(rxBuffer, BUFFER_SIZE);
                 dataAvailable = (bytesRead == BUFFER_SIZE);
         } else if (packetSize >= 4) {
-                uint8_t tempBuf[4];
-                bytesRead = udp.read(tempBuf, 4);
+                uint8_t tempBuf[12];
+                bytesRead = udp.read(tempBuf, sizeof(tempBuf));
                 if (processConfigPacket(tempBuf, bytesRead)) {
                         lastFrameTime = millis();
                         if (currentState != STATE_ACTIVE) {
@@ -270,9 +325,29 @@ void loop() {
                         srcIndex = constrain(srcIndex, 0, RECEIVED_LEDS - 1);
                         int offset = srcIndex * 3;
 
-                        leds[i] =
-                            CRGB(rxBuffer[offset + 0], rxBuffer[offset + 1], rxBuffer[offset + 2]);
+                        float target_r = rxBuffer[offset + 0] / 255.0f;
+                        float target_g = rxBuffer[offset + 1] / 255.0f;
+                        float target_b = rxBuffer[offset + 2] / 255.0f;
+
+                        boost_saturation_f(target_r, target_g, target_b, g_saturation);
+
+                        if (first_frame) {
+                                smoothed_colors[i].r = target_r;
+                                smoothed_colors[i].g = target_g;
+                                smoothed_colors[i].b = target_b;
+                        } else {
+                                smoothed_colors[i].r = g_smoothing * target_r + (1.0f - g_smoothing) * smoothed_colors[i].r;
+                                smoothed_colors[i].g = g_smoothing * target_g + (1.0f - g_smoothing) * smoothed_colors[i].g;
+                                smoothed_colors[i].b = g_smoothing * target_b + (1.0f - g_smoothing) * smoothed_colors[i].b;
+                        }
+
+                        leds[i] = CRGB(
+                            (uint8_t)(smoothed_colors[i].r * 255.0f + 0.5f),
+                            (uint8_t)(smoothed_colors[i].g * 255.0f + 0.5f),
+                            (uint8_t)(smoothed_colors[i].b * 255.0f + 0.5f)
+                        );
                 }
+                first_frame = false;
 
                 FastLED.show();
                 lastFrameTime = millis();

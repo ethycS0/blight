@@ -1,21 +1,55 @@
-#include <gio/gio.h>
-#include <gst/app/gstappsink.h>
-#include <gst/gst.h>
 #include <libportal/portal.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
-#if defined(SERIAL)
-#include "serial.h"
-#elif defined(WIFI)
+#include <linux/dma-buf.h>
+#include <pipewire/pipewire.h>
+#include <spa/buffer/buffer.h>
+#include <spa/param/video/format-utils.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#if defined(WIFI)
 #include "wifi.h"
 #endif
+
+struct PipeWireCtx {
+        struct pw_thread_loop *thread_loop;
+        struct pw_context *context;
+        struct pw_core *core;
+        struct pw_stream *stream;
+        struct spa_hook stream_listener;
+
+        // Dynamic Resolution Trackers
+        uint32_t real_width;
+        uint32_t real_height;
+        uint32_t real_stride;
+} g_pw;
+
+static void on_stream_process(void *data);
+static void on_stream_param_changed(void *data, uint32_t id, const struct spa_pod *param);
+
+static void on_stream_state_changed(void *data, enum pw_stream_state old,
+                                    enum pw_stream_state state, const char *error) {
+        if (error) {
+                g_printerr("Stream error: %s\n", error);
+        }
+}
+
+static const struct pw_stream_events stream_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .state_changed = on_stream_state_changed,
+    .process = on_stream_process,
+    .param_changed = on_stream_param_changed,
+};
 
 #define CAPTURE_WIDTH 160
 #define CAPTURE_HEIGHT 90
 #define CAPTURE_DEPTH 10
-#define CAPTURE_FPS 24
 
 typedef struct {
         unsigned char r, g, b;
@@ -30,345 +64,317 @@ static RGB g_final_buffer[((CAPTURE_HEIGHT - CAPTURE_DEPTH) / CAPTURE_DEPTH + 1)
                           ((CAPTURE_HEIGHT + CAPTURE_DEPTH - 1) / CAPTURE_DEPTH)];
 
 static XdpSession *g_session;
-static GstElement *g_pipeline;
-
-static ColorFloat *smoothed_colors = NULL;
 
 static int g_brightness = 150;
-static float g_saturation = 1;
-static float g_smoothing = 1;
+static float g_saturation = 1.0f;
+static float g_smoothing = 1.0f;
 
-static void apply_smoothing_filter(uint8_t *colors, int num_leds) {
-        if (smoothed_colors == NULL) {
-                smoothed_colors = calloc(num_leds, sizeof(ColorFloat));
-                for (int i = 0; i < num_leds; i++) {
-                        smoothed_colors[i].r = colors[i * 3];
-                        smoothed_colors[i].g = colors[i * 3 + 1];
-                        smoothed_colors[i].b = colors[i * 3 + 2];
+static struct {
+        bool is_bgr;
+} g_format_info = {true};
+
+#define MAX_CACHED_BUFFERS 64
+static struct {
+        int fd;
+        uint8_t *ptr;
+        size_t size;
+} mmap_cache[MAX_CACHED_BUFFERS];
+
+static void clear_mmap_cache() {
+        for (int i = 0; i < MAX_CACHED_BUFFERS; i++) {
+                if (mmap_cache[i].fd > 0 && mmap_cache[i].ptr != NULL) {
+                        munmap(mmap_cache[i].ptr, mmap_cache[i].size);
+                        mmap_cache[i].fd = 0;
+                        mmap_cache[i].ptr = NULL;
                 }
-                return;
-        }
-
-        for (int i = 0; i < num_leds; i++) {
-                smoothed_colors[i].r =
-                    g_smoothing * colors[i * 3] + (1.0f - g_smoothing) * smoothed_colors[i].r;
-                smoothed_colors[i].g =
-                    g_smoothing * colors[i * 3 + 1] + (1.0f - g_smoothing) * smoothed_colors[i].g;
-                smoothed_colors[i].b =
-                    g_smoothing * colors[i * 3 + 2] + (1.0f - g_smoothing) * smoothed_colors[i].b;
-
-                colors[i * 3] = (uint8_t)(smoothed_colors[i].r + 0.5f);
-                colors[i * 3 + 1] = (uint8_t)(smoothed_colors[i].g + 0.5f);
-                colors[i * 3 + 2] = (uint8_t)(smoothed_colors[i].b + 0.5f);
         }
 }
 
-static void boost_saturation(RGB *color, float boost) {
-        if (boost <= 1.0f)
-                return;
-
-        float r = color->r / 255.0f;
-        float g = color->g / 255.0f;
-        float b = color->b / 255.0f;
-
-        float max = fmaxf(r, fmaxf(g, b));
-        float min = fminf(r, fminf(g, b));
-        float delta = max - min;
-
-        if (delta < 0.001f) {
-                return;
-        }
-
-        float h, s, v = max;
-        s = delta / max;
-
-        if (r == max)
-                h = (g - b) / delta + (g < b ? 6.0f : 0.0f);
-        else if (g == max)
-                h = (b - r) / delta + 2.0f;
-        else
-                h = (r - g) / delta + 4.0f;
-        h /= 6.0f;
-
-        s = fminf(s * boost, 1.0f);
-
-        int i = (int)(h * 6.0f);
-        float f = h * 6.0f - i;
-        float p = v * (1.0f - s);
-        float q = v * (1.0f - f * s);
-        float t = v * (1.0f - (1.0f - f) * s);
-
-        switch (i % 6) {
-        case 0:
-                r = v;
-                g = t;
-                b = p;
-                break;
-        case 1:
-                r = q;
-                g = v;
-                b = p;
-                break;
-        case 2:
-                r = p;
-                g = v;
-                b = t;
-                break;
-        case 3:
-                r = p;
-                g = q;
-                b = v;
-                break;
-        case 4:
-                r = t;
-                g = p;
-                b = v;
-                break;
-        case 5:
-                r = v;
-                g = p;
-                b = q;
-                break;
-        }
-
-        color->r = (unsigned char)(r * 255.0f);
-        color->g = (unsigned char)(g * 255.0f);
-        color->b = (unsigned char)(b * 255.0f);
-}
-
-static void cleanup_smoothing() {
-        if (smoothed_colors != NULL) {
-                free(smoothed_colors);
-                smoothed_colors = NULL;
-        }
-}
-
-static void average_pixel_box(const unsigned char *data, int start_x, int start_y, int box_size,
-                              RGB *result) {
-        unsigned int total_r = 0, total_g = 0, total_b = 0;
-        const int stride = CAPTURE_WIDTH * 4;
-
-        const unsigned char *base = data + (start_y * stride) + (start_x * 4);
-
-        for (int dy = 0; dy < box_size; dy++) {
-                const unsigned char *row = base + (dy * stride);
-                for (int dx = 0; dx < box_size; dx++) {
-                        total_b += row[0];
-                        total_g += row[1];
-                        total_r += row[2];
-                        row += 4;
+static uint8_t *get_cached_mmap(int fd, size_t size, uint32_t offset) {
+        for (int i = 0; i < MAX_CACHED_BUFFERS; i++) {
+                if (mmap_cache[i].fd == fd) {
+                        return mmap_cache[i].ptr;
                 }
         }
-
-        int count = box_size * box_size;
-        result->r = total_r / count;
-        result->g = total_g / count;
-        result->b = total_b / count;
-
-        boost_saturation(result, g_saturation);
+        uint8_t *ptr = mmap(NULL, size + offset, PROT_READ, MAP_SHARED, fd, 0);
+        if (ptr != MAP_FAILED) {
+                for (int i = 0; i < MAX_CACHED_BUFFERS; i++) {
+                        if (mmap_cache[i].fd == 0) {
+                                mmap_cache[i].fd = fd;
+                                mmap_cache[i].ptr = ptr;
+                                mmap_cache[i].size = size + offset;
+                                return ptr;
+                        }
+                }
+                return ptr;
+        }
+        return NULL;
 }
 
-static GstFlowReturn on_new_sample(GstElement *sink, gpointer data) {
-        GstSample *sample;
-        GstBuffer *buffer;
-        GstMapInfo map;
-
-        sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-        if (!sample) {
-                return GST_FLOW_ERROR;
-        }
-
-        buffer = gst_sample_get_buffer(sample);
-        if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-                memset(g_final_buffer, 0, sizeof(g_final_buffer));
-
-                int buffer_index = 0;
-
-                // 1. LEFT EDGE: Bottom to top
-                for (int y = CAPTURE_HEIGHT - CAPTURE_DEPTH; y >= 0; y -= CAPTURE_DEPTH) {
-                        int x = 0;
-                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
-                                          &g_final_buffer[buffer_index++]);
-                }
-
-                // 2. TOP EDGE: Left to right
-                for (int x = 0; x < CAPTURE_WIDTH; x += CAPTURE_DEPTH) {
-                        int y = 0;
-                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
-                                          &g_final_buffer[buffer_index++]);
-                }
-
-                // 3. RIGHT EDGE: Top to bottom
-                for (int y = 0; y < CAPTURE_HEIGHT; y += CAPTURE_DEPTH) {
-                        int x = CAPTURE_WIDTH - CAPTURE_DEPTH;
-                        average_pixel_box(map.data, x, y, CAPTURE_DEPTH,
-                                          &g_final_buffer[buffer_index++]);
-                }
-
-                int num_leds = sizeof(g_final_buffer) / sizeof(RGB);
-                apply_smoothing_filter((uint8_t *)g_final_buffer, num_leds);
-
-                ssize_t result = 0;
-
-#if defined(SERIAL)
-                result = serial_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
-#elif defined(WIFI)
-                result = wifi_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
-#else
-#error "Define either SERIAL or WIFI"
-#endif
-
-                if (result < 0) {
-                        printf("Transmission error\n");
-                        exit(1);
-                }
-
-                gst_buffer_unmap(buffer, &map);
-        }
-
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
+static uint64_t get_time_ns() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-// static void start_gstreamer(int fd, int node) {
-//         GstElement *pipewiresrc, *appsink, *queue;
-//         GstCaps *caps;
-//         gchar *path;
-//
-//         gst_init(NULL, NULL);
-//
-//         g_pipeline = gst_pipeline_new("capture");
-//         if (!g_pipeline) {
-//                 g_printerr("Failed to create pipeline\n");
-//                 return;
-//         }
-//
-//         pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
-//         queue = gst_element_factory_make("queue", NULL);
-//         appsink = gst_element_factory_make("appsink", NULL);
-//
-//         if (!pipewiresrc || !queue || !appsink) {
-//                 g_printerr("Failed to create elements\n");
-//                 return;
-//         }
-//
-//         path = g_strdup_printf("%u", node);
-//         g_object_set(pipewiresrc, "fd", fd, "path", path, "always-copy", FALSE, NULL);
-//         g_free(path);
-//
-//         g_object_set(queue, "max-size-buffers", 1, "leaky", 2, NULL);
-//
-//         caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx", NULL);
-//
-//         g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop",
-//         TRUE,
-//                      "caps", caps, NULL);
-//         gst_caps_unref(caps);
-//
-//         g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), NULL);
-//
-//         gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, queue, appsink, NULL);
-//
-//         if (!gst_element_link_many(pipewiresrc, queue, appsink, NULL)) {
-//                 g_printerr("Failed to link elements\n");
-//                 return;
-//         }
-//
-//         gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
-//         g_print("Pipeline running\n");
-// }
-
-static void start_gstreamer(int fd, int node) {
-        GstElement *pipewiresrc, *appsink, *videorate, *queue, *videoconvertscale, *fps_filter;
-        GstCaps *caps, *fps_caps;
-        gchar *path;
-
-        gst_init(NULL, NULL);
-
-        g_pipeline = gst_pipeline_new("capture");
-        if (!g_pipeline) {
-                g_printerr("Failed to create pipeline\n");
-                return;
-        }
-
-        pipewiresrc = gst_element_factory_make("pipewiresrc", NULL);
-        videorate = gst_element_factory_make("videorate", NULL);
-        fps_filter = gst_element_factory_make("capsfilter", "fps_filter");
-        videoconvertscale = gst_element_factory_make("videoconvertscale", NULL);
-        queue = gst_element_factory_make("queue", NULL);
-        appsink = gst_element_factory_make("appsink", NULL);
-
-        if (!pipewiresrc || !videoconvertscale || !videorate || !queue || !appsink || !fps_filter) {
-                g_printerr("Failed to create elements\n");
-                return;
-        }
-
-        path = g_strdup_printf("%u", node);
-        g_object_set(pipewiresrc, "fd", fd, "path", path, "always-copy", FALSE, NULL);
-        g_free(path);
-
-        g_object_set(videorate, "skip-to-first", TRUE, "drop-only", TRUE, NULL);
-        fps_caps = gst_caps_new_simple("video/x-raw", "framerate", GST_TYPE_FRACTION, CAPTURE_FPS,
-                                       1, NULL);
-        g_object_set(fps_filter, "caps", fps_caps, NULL);
-        gst_caps_unref(fps_caps);
-
-        g_object_set(queue, "max-size-buffers", 1, "max-size-bytes", 0, "max-size-time", 0, "leaky",
-                     2, NULL);
-        g_object_set(videoconvertscale, "n-threads", 0, "dither", 0, "method", 0, NULL);
-        g_object_set(appsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 1, "drop", TRUE,
-                     NULL);
-        g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample), NULL);
-
-        gst_bin_add_many(GST_BIN(g_pipeline), pipewiresrc, queue, videorate, fps_filter,
-                         videoconvertscale, appsink, NULL);
-
-        if (!gst_element_link_many(pipewiresrc, queue, videorate, fps_filter, videoconvertscale,
-                                   NULL)) {
-                g_printerr("Failed to link elements\n");
-                return;
-        }
-
-        caps =
-            gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx", "width", G_TYPE_INT,
-                                CAPTURE_WIDTH, "height", G_TYPE_INT, CAPTURE_HEIGHT, NULL);
-
-        if (!gst_element_link_filtered(videoconvertscale, appsink, caps)) {
-                g_printerr("Failed to link with caps filter\n");
-                gst_caps_unref(caps);
-                return;
-        }
-
-        gst_caps_unref(caps);
-
-        gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
-        g_print("Pipeline running\n");
-}
+static uint64_t last_frame_time = 0;
 
 static int send_config(uint8_t brightness) {
-        uint8_t config_packet[4] = {
-            0xFF,      // Magic byte
-            0xAA,      // Config identifier
-            brightness // 0-255
-        };
+        uint8_t config_packet[12];
+        config_packet[0] = 0xFF;
+        config_packet[1] = 0xAA;
+        config_packet[2] = brightness;
+        config_packet[3] = 0x00; // padding
+
+        // Pass the floating point tuning parameters to ESP32
+        memcpy(&config_packet[4], &g_saturation, sizeof(float));
+        memcpy(&config_packet[8], &g_smoothing, sizeof(float));
 
         ssize_t result = 0;
 
-#if defined(SERIAL)
-        result = serial_tx(config_packet, sizeof(config_packet));
-#elif defined(WIFI)
+#if defined(WIFI)
         result = wifi_tx(config_packet, sizeof(config_packet));
-#else
-#error "Define either SERIAL or WIFI"
 #endif
 
         if (result < 0) {
+#ifdef DEBUG
                 printf("Config send failed\n");
+#endif
                 return -1;
         }
 
         usleep(600000);
         return 0;
+}
+
+static void average_pixel_box(const unsigned char *data, size_t max_mapped_size, int start_x,
+                              int start_y, int box_w, int box_h, int stride, RGB *result) {
+        unsigned int total_r = 0, total_g = 0, total_b = 0;
+        int count = 0;
+
+        if (g_format_info.is_bgr) {
+                for (int dy = 0; dy < box_h; dy += CAPTURE_DEPTH) {
+                        int current_y = start_y + dy;
+                        if ((size_t)(current_y * stride) >= max_mapped_size)
+                                break;
+
+                        const unsigned char *row = data + (current_y * stride);
+
+                        for (int dx = 0; dx < box_w; dx += CAPTURE_DEPTH) {
+                                size_t byte_offset = (start_x + dx) * 4;
+                                if ((size_t)(current_y * stride) + byte_offset + 3 >=
+                                    max_mapped_size)
+                                        break;
+
+                                const unsigned char *px = row + byte_offset;
+                                total_b += px[0];
+                                total_g += px[1];
+                                total_r += px[2];
+                                count++;
+                        }
+                }
+        } else {
+                for (int dy = 0; dy < box_h; dy += CAPTURE_DEPTH) {
+                        int current_y = start_y + dy;
+                        if ((size_t)(current_y * stride) >= max_mapped_size)
+                                break;
+
+                        const unsigned char *row = data + (current_y * stride);
+
+                        for (int dx = 0; dx < box_w; dx += CAPTURE_DEPTH) {
+                                size_t byte_offset = (start_x + dx) * 4;
+                                if ((size_t)(current_y * stride) + byte_offset + 3 >=
+                                    max_mapped_size)
+                                        break;
+
+                                const unsigned char *px = row + byte_offset;
+                                total_r += px[0];
+                                total_g += px[1];
+                                total_b += px[2];
+                                count++;
+                        }
+                }
+        }
+
+        if (count == 0)
+                count = 1;
+        result->r = total_r / count;
+        result->g = total_g / count;
+        result->b = total_b / count;
+}
+
+static void on_stream_process(void *data) {
+        struct PipeWireCtx *ctx = data;
+        struct pw_buffer *pw_buf;
+
+        if ((pw_buf = pw_stream_dequeue_buffer(ctx->stream)) == NULL) {
+                return;
+        }
+
+        uint64_t now = get_time_ns();
+        if (now - last_frame_time < 1000000000ULL / 60) {
+                pw_stream_queue_buffer(ctx->stream, pw_buf);
+                return;
+        }
+        last_frame_time = now;
+
+        if (ctx->real_width == 0 || ctx->real_height == 0) {
+                pw_stream_queue_buffer(ctx->stream, pw_buf);
+                return;
+        }
+
+        struct spa_buffer *buf = pw_buf->buffer;
+        if (!buf || !buf->datas || buf->n_datas == 0) {
+                pw_stream_queue_buffer(ctx->stream, pw_buf);
+                return;
+        }
+
+        uint32_t current_stride = ctx->real_stride;
+        if (buf->datas[0].chunk != NULL && buf->datas[0].chunk->stride > 0) {
+                current_stride = buf->datas[0].chunk->stride;
+        }
+
+        uint32_t size = buf->datas[0].maxsize;
+        uint32_t true_size = current_stride * ctx->real_height;
+        if (size < true_size) {
+                size = true_size;
+        }
+
+        uint8_t *raw_pixels = NULL;
+        bool mapped = false;
+        int fd = -1;
+        uint32_t offset = buf->datas[0].mapoffset;
+        struct dma_buf_sync sync = {0};
+
+        if (buf->datas[0].data != NULL) {
+                // PipeWire already mapped it for us
+                raw_pixels = buf->datas[0].data;
+        } else if (buf->datas[0].type == SPA_DATA_MemFd || buf->datas[0].type == SPA_DATA_DmaBuf) {
+                fd = buf->datas[0].fd;
+                raw_pixels = get_cached_mmap(fd, size, offset);
+                if (raw_pixels != NULL) {
+                        mapped = true;
+                        raw_pixels += offset;
+                }
+        }
+
+        if (raw_pixels != NULL) {
+                if (buf->datas[0].type == SPA_DATA_DmaBuf && fd != -1) {
+                        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                        ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+                } else if (buf->datas[0].type == SPA_DATA_DmaBuf && buf->datas[0].fd != -1) {
+                        sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                        ioctl(buf->datas[0].fd, DMA_BUF_IOCTL_SYNC, &sync);
+                }
+
+                for (uint32_t i = 0; i < size; i += 4096) {
+                        if (raw_pixels[i] != 0) {
+                                break;
+                        }
+                }
+
+                memset(g_final_buffer, 0, sizeof(g_final_buffer));
+                int buffer_index = 0;
+
+                int real_box_w = (CAPTURE_DEPTH * ctx->real_width) / CAPTURE_WIDTH;
+                int real_box_h = (CAPTURE_DEPTH * ctx->real_height) / CAPTURE_HEIGHT;
+                if (real_box_w < 1)
+                        real_box_w = 1;
+                if (real_box_h < 1)
+                        real_box_h = 1;
+
+                // 1. LEFT EDGE: Bottom to top
+                for (int y = CAPTURE_HEIGHT - CAPTURE_DEPTH; y >= 0; y -= CAPTURE_DEPTH) {
+                        int real_x = 0;
+                        int real_y = (y * ctx->real_height) / CAPTURE_HEIGHT;
+
+                        average_pixel_box(raw_pixels, size, real_x, real_y, real_box_w, real_box_h,
+                                          current_stride, &g_final_buffer[buffer_index++]);
+                }
+
+                // 2. TOP EDGE: Left to right
+                for (int x = 0; x < CAPTURE_WIDTH; x += CAPTURE_DEPTH) {
+                        int real_x = (x * ctx->real_width) / CAPTURE_WIDTH;
+                        int real_y = 0;
+
+                        average_pixel_box(raw_pixels, size, real_x, real_y, real_box_w, real_box_h,
+                                          current_stride, &g_final_buffer[buffer_index++]);
+                }
+
+                // 3. RIGHT EDGE: Top to bottom
+                for (int y = 0; y < CAPTURE_HEIGHT; y += CAPTURE_DEPTH) {
+                        int real_x =
+                            ((CAPTURE_WIDTH - CAPTURE_DEPTH) * ctx->real_width) / CAPTURE_WIDTH;
+                        int real_y = (y * ctx->real_height) / CAPTURE_HEIGHT;
+
+                        average_pixel_box(raw_pixels, size, real_x, real_y, real_box_w, real_box_h,
+                                          current_stride, &g_final_buffer[buffer_index++]);
+                }
+
+                int num_leds = sizeof(g_final_buffer) / sizeof(RGB);
+
+#ifdef DEBUG
+                // PRINT TO TERMINAL
+                printf("\r");
+                for (int i = 0; i < num_leds; i++) {
+                        printf("\x1b[48;2;%d;%d;%dm  ", g_final_buffer[i].r, g_final_buffer[i].g,
+                               g_final_buffer[i].b);
+                }
+                printf("\x1b[0m"); // reset color
+                fflush(stdout);
+#endif
+
+#if defined(WIFI)
+                ssize_t tx_res = wifi_tx((uint8_t *)g_final_buffer, sizeof(g_final_buffer));
+#ifdef DEBUG
+                if (tx_res < 0) {
+                        printf("\r[FRAME] Transmission error\n");
+                }
+#endif
+#endif
+
+                if (buf->datas[0].type == SPA_DATA_DmaBuf && fd != -1) {
+                        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                        ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+                } else if (buf->datas[0].type == SPA_DATA_DmaBuf && buf->datas[0].fd != -1) {
+                        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                        ioctl(buf->datas[0].fd, DMA_BUF_IOCTL_SYNC, &sync);
+                }
+        }
+
+        pw_stream_queue_buffer(ctx->stream, pw_buf);
+}
+
+static void on_stream_param_changed(void *data, uint32_t id, const struct spa_pod *param) {
+        struct PipeWireCtx *ctx = data;
+
+        if (param == NULL || id != SPA_PARAM_Format) {
+                return;
+        }
+
+        struct spa_video_info_raw info;
+        if (spa_format_video_raw_parse(param, &info) < 0) {
+                g_printerr("Failed to parse video format layout\n");
+                return;
+        }
+
+        if (info.format == SPA_VIDEO_FORMAT_BGRx || info.format == SPA_VIDEO_FORMAT_BGRA) {
+                g_format_info.is_bgr = true;
+        } else {
+                g_format_info.is_bgr = false;
+        }
+
+        ctx->real_width = info.size.width;
+        ctx->real_height = info.size.height;
+        ctx->real_stride = ctx->real_width * 4;
+
+        clear_mmap_cache();
+
+#ifdef DEBUG
+        g_print("\nScreen Capture Active: Natively sampling at %dx%d (Format: %s)\n",
+                ctx->real_width, ctx->real_height,
+                g_format_info.is_bgr ? "BGRx/BGRA" : "RGBx/RGBA");
+#endif
 }
 
 static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) {
@@ -389,35 +395,93 @@ static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) 
                 g_variant_iter_init(&iter, streams);
                 GVariant *options;
                 g_variant_iter_next(&iter, "(u@a{sv})", &node, &options);
+#ifdef DEBUG
                 g_print("PipeWire Node: %d\n", node);
+#endif
                 g_variant_unref(options);
         }
 
         int fd = xdp_session_open_pipewire_remote(session);
+#ifdef DEBUG
         g_print("PipeWire FD: %d\n", fd);
-
-#if defined(SERIAL)
-        if (serial_init("/dev/ttyUSB0", 921600, 1000) == -1) {
-                printf("No device found\n");
-                exit(1);
-        }
-#elif defined(WIFI)
-        if (wifi_init("192.168.1.100", 4210, 1000) == -1) {
-                printf("No device found\n");
-                exit(1);
-        }
-#else
-#error "Define either SERIAL or WIFI"
 #endif
 
-        if (send_config(g_brightness) == -1) {
-                printf("Failed to Send Config.");
+#if defined(WIFI)
+        if (wifi_init("192.168.1.100", 4210, 1000) == -1) {
+#ifdef DEBUG
+                printf("No device found\n");
+#endif
                 exit(1);
         }
-
+        if (send_config(g_brightness) == -1) {
+#ifdef DEBUG
+                printf("Failed to Send Config.\n");
+#endif
+                exit(1);
+        }
+#ifdef DEBUG
         printf("Config sent: brightness=%d\n", g_brightness);
+#endif
+#endif
 
-        start_gstreamer(fd, node);
+        pw_init(NULL, NULL);
+
+        g_pw.thread_loop = pw_thread_loop_new("pipewire-render-thread", NULL);
+        struct pw_loop *loop = pw_thread_loop_get_loop(g_pw.thread_loop);
+
+        g_pw.context = pw_context_new(loop, NULL, 0);
+        g_pw.core = pw_context_connect_fd(g_pw.context, fd, NULL, 0);
+        if (!g_pw.core) {
+                g_printerr("Failed to connect to PipeWire remote FD\n");
+                return;
+        }
+
+        g_pw.stream =
+            pw_stream_new(g_pw.core, "screencast-capture",
+                          pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY,
+                                            "Capture", PW_KEY_MEDIA_ROLE, "Screen", NULL));
+
+        pw_stream_add_listener(g_pw.stream, &g_pw.stream_listener, &stream_events, &g_pw);
+
+        uint8_t buffer[2048];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+        const struct spa_pod *params[2];
+
+        params[0] = spa_pod_builder_add_object(
+            &b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
+            SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype,
+            SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), SPA_FORMAT_VIDEO_format,
+            SPA_POD_CHOICE_ENUM_Id(
+                9, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx,
+                SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_xRGB,
+                SPA_VIDEO_FORMAT_xBGR, SPA_VIDEO_FORMAT_ARGB, SPA_VIDEO_FORMAT_ABGR),
+            SPA_FORMAT_VIDEO_size,
+            SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(320, 240), &SPA_RECTANGLE(1, 1),
+                                           &SPA_RECTANGLE(16384, 16384)),
+            SPA_FORMAT_VIDEO_framerate,
+            SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1),
+                                          &SPA_FRACTION(1000, 1)),
+            // Use 0 as modifier choice just to be safe but pipewire might negotiate without it
+            SPA_FORMAT_VIDEO_modifier, SPA_POD_CHOICE_ENUM_Long(2, 0, 0), NULL);
+
+        params[1] = spa_pod_builder_add_object(
+            &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers, SPA_PARAM_BUFFERS_dataType,
+            SPA_POD_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr)),
+            NULL);
+
+        int res_conn =
+            pw_stream_connect(g_pw.stream, PW_DIRECTION_INPUT, node,
+                              PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 2);
+
+        if (res_conn < 0) {
+                g_printerr("Stream connection failed\n");
+                return;
+        }
+
+        pw_thread_loop_start(g_pw.thread_loop);
+#ifdef DEBUG
+        g_print("PipeWire stream processing thread started natively.\n");
+#endif
 }
 
 static void create_session_cb(GObject *source, GAsyncResult *res, gpointer data) {
@@ -431,7 +495,9 @@ static void create_session_cb(GObject *source, GAsyncResult *res, gpointer data)
                 return;
         }
 
+#ifdef DEBUG
         g_print("Session created\n");
+#endif
         g_session = session;
 
         xdp_session_start(session, NULL, NULL, start_session_cb, NULL);
@@ -441,11 +507,9 @@ int main(int argc, const char *argv[]) {
         if (argc >= 2) {
                 g_brightness = atoi(argv[1]);
         }
-
         if (argc >= 3) {
                 g_saturation = atof(argv[2]);
         }
-
         if (argc >= 4) {
                 g_smoothing = atof(argv[3]);
                 if (g_smoothing < 0.1f)
@@ -462,7 +526,6 @@ int main(int argc, const char *argv[]) {
                                              NULL, NULL, create_session_cb, NULL);
 
         g_main_loop_run(loop);
-        cleanup_smoothing();
 
         return 0;
 }

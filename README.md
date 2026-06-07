@@ -1,79 +1,77 @@
 # Blight: Bias Lighting for Wayland
 
-Real-time bias lighting system for Linux Wayland using ESP32 + WS2812B LEDs. Captures screen edges via PipeWire and sends RGB data to ESP32 over WiFi or serial.
+Real-time bias lighting system for Linux Wayland using ESP32 + WS2812B LEDs. Captures screen edges via PipeWire (using XDG Desktop Portal) and sends RGB data to ESP32 over WiFi.
 
 ## Overview
 
-Uses PipeWire + XDG Desktop Portal + GStreamer to capture screen borders, downsamples to LED grid resolution (160x90@24hz), and transmits color data to ESP32. Optimized for minimal CPU usage (<2%).
+Uses `libportal` and `PipeWire` to capture screen borders, downsamples to an LED grid, and transmits color data to an ESP32 via UDP. Optimized for minimal CPU usage and low latency by accessing native PipeWire buffers.
 
-**Pipeline:** `pipewiresrc → queue → videorate → capsfilter → videoconvertscale → appsink`
+**Workflow:**
+1. Request screencast via XDG Desktop Portal (`libportal`).
+2. Capture buffers directly from PipeWire (supports DMA-BUF and MemFd).
+3. Sample edges (Left, Top, Right) and average colors.
+4. Transmit RGB data to ESP32 over WiFi/UDP.
 
 ## Hardware
 
 - ESP32 with WiFi
-- WS2812B LED strip
-- USB-C PD power supply with 3A fuse
-- My setup: 68 LEDs (32 bottom + 18 left + 18 right)
+- WS2812B LED strip (connected to GPIO 14)
+- USB-C power supply
+- Recommended setup: ~62 LEDs for a standard monitor
 
-## Build (NixOS)
+## Build
 
+### Prerequisites
+Ensure you have the following development libraries installed:
+- `libportal`
+- `glib-2.0`
+- `libpipewire-0.3`
+- `pkg-config`
+- `gcc`
+- `make`
+
+### Compilation
+Simply run:
 ```bash
-# Serial communication (default)
-nix build .#blight_serial
-
-# WiFi communication
-nix build .#blight_wifi
-
-# Development shell
-nix develop
+make
 ```
-
-**Note:** GPU builds (`blight_*_gpu`) not supported this commit - VA-API causes 60% CPU usage.
+This builds the `blight` binary. The default configuration uses WiFi communication.
 
 ## Usage
 
 ```bash
-./result/bin/blight [brightness] [saturation] [smoothing]
+./blight [brightness] [saturation] [smoothing]
 ```
 
 **Parameters:**
 
 - `brightness`: 0-255 (default: 150)
-- `saturation`: float (default: 1.0, try 1.5-2.0 for more vibrant colors)
-- `smoothing`: 0.1-1.0 (default: 1.0, lower = smoother transitions)
+- `saturation`: float (default: 1.0, determines color vibrancy. Try 1.5-2.0)
+- `smoothing`: 0.1-1.0 (default: 1.0, lower values = smoother transitions)
 
 **Example:**
 
 ```bash
-./result/bin/blight 200 1.8 0.7
+./blight 200 1.8 0.7
 ```
 
 ## ESP32 Setup
 
-1. Edit `esp32/main/creds.h` with WiFi credentials (WiFi mode)
-2. Configure LED pin/count in `esp32/main/main.ino`
-3. Flash to ESP32
-4. **Serial:** Connects to `/dev/ttyUSB0` at 921600 baud
-5. **WiFi:** Edit IP in `src/wifi.c`, ESP32 listens on port 4210
+1. **Credentials:** Create `esp32/main/creds.h` with your WiFi info:
+   ```cpp
+   #define WIFI_SSID "YourSSID"
+   #define WIFI_PASS "YourPassword"
+   ```
+2. **Configuration:** Adjust `NUM_LEDS` and `DATA_PIN` in `esp32/main/main.ino` if necessary.
+3. **Flash:** Use Arduino IDE or `arduino-cli` to flash the ESP32.
+4. **Network:** The host app expects the ESP32 at `192.168.1.100` (static IP) by default. You can change this in `src/main.c`.
 
 ## Performance Note
 
-CPU usage is minimal, but active PipeWire screencast causes GPU sync points on GNOME/Mutter, leading to 7-10% FPS drop in intensive games. This is a compositor limitation. KDE Plasma handles this better, or disable when gaming.
+CPU usage is minimal (<2%) as it avoids heavy processing pipelines. Note that any PipeWire screencast may cause minor FPS drops in some Wayland compositors (like GNOME/Mutter) due to how they handle buffer synchronization.
 
 ## TODO
 
-- [ ] **Daemon + Control Tool**: Implement `blightd` daemon with `blightctl` for runtime control
-  - Start/stop capture without restarting
-  - Adjust brightness/saturation/smoothing on the fly
-  - Unix socket IPC for low overhead
-- [ ] **XDG Portal Token Restoration**: Save authorization token for persistent permissions
-  - No permission dialog on every startup
-  - Store in `~/.config/blight/portal_token`
-  - Requires portal protocol v4+ (xdg-desktop-portal ≥1.12.1)
-- [ ] **Black Boundary Detection**: Skip black bars for different aspect ratios
-  - Auto-detect letterboxing (21:9 content on 16:9 display)
-  - Auto-detect pillarboxing (4:3 content on 16:9 display)
-  - Sample only actual video content, ignore black borders
-  - Better color accuracy for non-native aspect ratio content
-
----
+- [ ] **Daemon + Control Tool**: Implement `blightd` daemon with `blightctl` for runtime control.
+- [ ] **XDG Portal Token Restoration**: Save authorization token to avoid permission dialogs on startup.
+- [ ] **Black Boundary Detection**: Automatically skip black bars (letterboxing) for different aspect ratios.

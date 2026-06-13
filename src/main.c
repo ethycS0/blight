@@ -50,6 +50,7 @@ static const struct pw_stream_events stream_events = {
 #define CAPTURE_WIDTH 160
 #define CAPTURE_HEIGHT 90
 #define CAPTURE_DEPTH 10
+#define CAPTURE_FRAMES 24
 
 typedef struct {
         unsigned char r, g, b;
@@ -212,7 +213,7 @@ static void on_stream_process(void *data) {
         }
 
         uint64_t now = get_time_ns();
-        if (now - last_frame_time < 1000000000ULL / 60) {
+        if (now - last_frame_time < 1000000000ULL / CAPTURE_FRAMES) {
                 pw_stream_queue_buffer(ctx->stream, pw_buf);
                 return;
         }

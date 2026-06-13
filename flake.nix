@@ -17,6 +17,28 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
+        packages.default = pkgs.stdenv.mkDerivation {
+          pname = "blight";
+          version = "1.0.0";
+          src = ./.;
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            gcc
+          ];
+
+          buildInputs = with pkgs; [
+            pipewire
+            glib
+            libportal
+          ];
+
+          installPhase = ''
+            mkdir -p $out/bin
+            cp blight $out/bin/blight
+          '';
+        };
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -37,6 +59,7 @@
             export ARDUINO_DIRECTORIES_DATA="$PWD/esp32/.arduino/data"
             export ARDUINO_DIRECTORIES_DOWNLOADS="$PWD/esp32/.arduino/downloads"
             export ARDUINO_DIRECTORIES_USER="$PWD/esp32/.arduino/user"
+            export ARDUINO_DIRECTORIES_USER="$PWD/esp32/.arduino/user"
             export ARDUINO_CONFIG_FILE="$PWD/esp32/.arduino/arduino-cli.yaml"
 
             echo "Checking ESP32 Arduino Core..."
@@ -55,10 +78,6 @@
             else
               echo "ESP32 core is already installed."
             fi
-
-
-
-
           '';
         };
       }

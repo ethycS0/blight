@@ -23,6 +23,21 @@
 #define SERIAL_BAUD 921600
 #endif
 
+// Fixed light quality settings. Saturation handling was removed: the host now
+// sends the physically-correct average color straight through, so the LEDs
+// match the screen without an HSV boost that skewed hue/saturation.
+#define LED_BRIGHTNESS 250
+// Interpolation time constant. Frames arrive at the host's capture rate, but
+// the LEDs are eased toward the latest target against real elapsed time so
+// motion stays smooth regardless of packet jitter or rate.
+#define LED_SMOOTHING_TAU_MS 40.0f
+#define LED_ANIM_INTERVAL_MS 10 // ~100Hz animation
+
+// Command packets share the 0xFF 0xAA magic prefix and must match src/main.c.
+#define CMD_CONFIG 0x01 // [3] = brightness
+#define CMD_STATIC 0x02 // [3..5] = R, G, B
+#define CMD_LIVE 0x03   // no payload, resume screen-capture mode
+
 #ifdef WIFI
 
 #if __has_include("creds.h")
@@ -48,25 +63,26 @@ WiFiUDP udp;
 
 #define BUFFER_SIZE (RECEIVED_LEDS * 3)
 #define TIMEOUT_MS 10000
+#define COMMAND_BUFFER_SIZE 8
 #define STARTUP_BLINK_DURATION 2000
 
-enum SystemState { STATE_WAITING_CONFIG, STATE_ACTIVE, STATE_TIMEOUT };
+enum SystemState { STATE_WAITING_CONFIG, STATE_ACTIVE, STATE_STATIC, STATE_TIMEOUT };
 
 CRGB leds[NUM_LEDS];
 uint8_t rxBuffer[BUFFER_SIZE];
 
-uint8_t g_brightness = 150;
-float g_saturation = 1.0f;
-float g_smoothing = 1.0f;
+uint8_t g_brightness = LED_BRIGHTNESS;
 
 struct ColorFloat {
         float r, g, b;
 };
 
+ColorFloat target_colors[NUM_LEDS];
 ColorFloat smoothed_colors[NUM_LEDS];
 bool first_frame = true;
 
 unsigned long lastFrameTime = 0;
+unsigned long lastAnimationTime = 0;
 SystemState currentState = STATE_WAITING_CONFIG;
 
 void startupBlink() {
@@ -88,107 +104,87 @@ void startupBlink() {
         FastLED.show();
 }
 
-void boost_saturation_f(float &r, float &g, float &b, float boost) {
-        if (boost <= 1.0f) return;
+// Eases the physical LEDs toward target_colors[] using a time-based factor and
+// pushes them out. Shared by live and static modes so transitions feel identical.
+void updateLEDs(float alpha) {
+        for (int i = 0; i < NUM_LEDS; i++) {
+                float tr = target_colors[i].r;
+                float tg = target_colors[i].g;
+                float tb = target_colors[i].b;
 
-        float max_val = max(r, max(g, b));
-        float min_val = min(r, min(g, b));
-        float delta = max_val - min_val;
+                if (first_frame) {
+                        smoothed_colors[i].r = tr;
+                        smoothed_colors[i].g = tg;
+                        smoothed_colors[i].b = tb;
+                } else {
+                        smoothed_colors[i].r =
+                            alpha * tr + (1.0f - alpha) * smoothed_colors[i].r;
+                        smoothed_colors[i].g =
+                            alpha * tg + (1.0f - alpha) * smoothed_colors[i].g;
+                        smoothed_colors[i].b =
+                            alpha * tb + (1.0f - alpha) * smoothed_colors[i].b;
+                }
 
-        if (delta < 0.001f) return;
+                leds[i] = CRGB(
+                    (uint8_t)(constrain(smoothed_colors[i].r * 255.0f + 0.5f, 0.0f, 255.0f)),
+                    (uint8_t)(constrain(smoothed_colors[i].g * 255.0f + 0.5f, 0.0f, 255.0f)),
+                    (uint8_t)(constrain(smoothed_colors[i].b * 255.0f + 0.5f, 0.0f, 255.0f)));
+        }
+        first_frame = false;
 
-        float h, s, v = max_val;
-        s = delta / max_val;
+        FastLED.show();
+}
 
-        if (r == max_val)
-                h = (g - b) / delta + (g < b ? 6.0f : 0.0f);
-        else if (g == max_val)
-                h = (b - r) / delta + 2.0f;
-        else
-                h = (r - g) / delta + 4.0f;
-        h /= 6.0f;
-
-        s = min(s * boost, 1.0f);
-
-        int i = (int)(h * 6.0f);
-        float f = h * 6.0f - i;
-        float p = v * (1.0f - s);
-        float q = v * (1.0f - f * s);
-        float t = v * (1.0f - (1.0f - f) * s);
-
-        switch (i % 6) {
-        case 0: r = v; g = t; b = p; break;
-        case 1: r = q; g = v; b = p; break;
-        case 2: r = p; g = v; b = t; break;
-        case 3: r = p; g = q; b = v; break;
-        case 4: r = t; g = p; b = v; break;
-        case 5: r = v; g = p; b = q; break;
+void setAllTargets(uint8_t r, uint8_t g, uint8_t b) {
+        float fr = r / 255.0f;
+        float fg = g / 255.0f;
+        float fb = b / 255.0f;
+        for (int i = 0; i < NUM_LEDS; i++) {
+                target_colors[i].r = fr;
+                target_colors[i].g = fg;
+                target_colors[i].b = fb;
         }
 }
 
-bool processConfigPacket(uint8_t *buffer, size_t size) {
-        if (size >= 4 && buffer[0] == 0xFF && buffer[1] == 0xAA) {
-                g_brightness = buffer[2];
+// Returns true when the packet was a recognized command.
+bool processCommandPacket(const uint8_t *buffer, size_t size) {
+        if (size < 4 || buffer[0] != 0xFF || buffer[1] != 0xAA)
+                return false;
+
+        switch (buffer[2]) {
+        case CMD_CONFIG:
+                g_brightness = buffer[3];
                 FastLED.setBrightness(g_brightness);
-                
-                if (size >= 12) {
-                        float temp_sat, temp_smooth;
-                        memcpy(&temp_sat, &buffer[4], sizeof(float));
-                        memcpy(&temp_smooth, &buffer[8], sizeof(float));
-                        if (!isnan(temp_sat) && isfinite(temp_sat) && temp_sat >= 0.0f && temp_sat <= 10.0f) {
-                                g_saturation = temp_sat;
-                        }
-                        if (!isnan(temp_smooth) && isfinite(temp_smooth) && temp_smooth >= 0.01f && temp_smooth <= 1.0f) {
-                                g_smoothing = temp_smooth;
-                        }
-                }
+                return true;
 
-                if (currentState != STATE_ACTIVE) {
-                        fill_solid(leds, NUM_LEDS, CRGB::Green);
-                        FastLED.show();
-                        delay(100);
-                        FastLED.clear();
-                        FastLED.show();
-                }
+        case CMD_STATIC:
+                if (size < 6)
+                        return false;
+                setAllTargets(buffer[3], buffer[4], buffer[5]);
+                currentState = STATE_STATIC;
+                return true;
 
+        case CMD_LIVE:
+                currentState = STATE_ACTIVE;
                 return true;
         }
+
         return false;
 }
 
 void processFramePacket(const uint8_t *buffer, size_t size) {
-        if (size != BUFFER_SIZE) return;
+        if (size != BUFFER_SIZE)
+                return;
 
         for (int i = 0; i < NUM_LEDS; i++) {
                 int srcIndex = (i * RECEIVED_LEDS) / NUM_LEDS;
                 srcIndex = constrain(srcIndex, 0, RECEIVED_LEDS - 1);
                 int offset = srcIndex * 3;
 
-                float target_r = buffer[offset + 0] / 255.0f;
-                float target_g = buffer[offset + 1] / 255.0f;
-                float target_b = buffer[offset + 2] / 255.0f;
-
-                boost_saturation_f(target_r, target_g, target_b, g_saturation);
-
-                if (first_frame) {
-                        smoothed_colors[i].r = target_r;
-                        smoothed_colors[i].g = target_g;
-                        smoothed_colors[i].b = target_b;
-                } else {
-                        smoothed_colors[i].r = g_smoothing * target_r + (1.0f - g_smoothing) * smoothed_colors[i].r;
-                        smoothed_colors[i].g = g_smoothing * target_g + (1.0f - g_smoothing) * smoothed_colors[i].g;
-                        smoothed_colors[i].b = g_smoothing * target_b + (1.0f - g_smoothing) * smoothed_colors[i].b;
-                }
-
-                leds[i] = CRGB(
-                    (uint8_t)(constrain(smoothed_colors[i].r * 255.0f + 0.5f, 0.0f, 255.0f)),
-                    (uint8_t)(constrain(smoothed_colors[i].g * 255.0f + 0.5f, 0.0f, 255.0f)),
-                    (uint8_t)(constrain(smoothed_colors[i].b * 255.0f + 0.5f, 0.0f, 255.0f))
-                );
+                target_colors[i].r = buffer[offset + 0] / 255.0f;
+                target_colors[i].g = buffer[offset + 1] / 255.0f;
+                target_colors[i].b = buffer[offset + 2] / 255.0f;
         }
-        first_frame = false;
-
-        FastLED.show();
 }
 
 void enterTimeoutState() {
@@ -304,25 +300,23 @@ void loop() {
 
 #ifdef WIFI
         if (WiFi.status() == WL_CONNECTED) {
-                int packetSize = udp.parsePacket();
-                if (packetSize == BUFFER_SIZE) {
-                        size_t bytesRead = udp.read(rxBuffer, BUFFER_SIZE);
-                        if (bytesRead == BUFFER_SIZE) {
-                                processFramePacket(rxBuffer, BUFFER_SIZE);
-                                lastFrameTime = millis();
-                                currentState = STATE_ACTIVE;
-                        }
-                } else if (packetSize >= 4 && packetSize < BUFFER_SIZE) {
-                        uint8_t tempBuf[12];
-                        size_t bytesRead = udp.read(tempBuf, sizeof(tempBuf));
-                        if (bytesRead >= 4 && tempBuf[0] == 0xFF && tempBuf[1] == 0xAA) {
-                                if (processConfigPacket(tempBuf, bytesRead)) {
+                // Drain everything queued this tick so a burst of frames can't
+                // back up and stall the socket.
+                int packetSize;
+                while ((packetSize = udp.parsePacket()) > 0) {
+                        if (packetSize == BUFFER_SIZE) {
+                                if (udp.read(rxBuffer, BUFFER_SIZE) == BUFFER_SIZE) {
+                                        processFramePacket(rxBuffer, BUFFER_SIZE);
                                         lastFrameTime = millis();
                                         currentState = STATE_ACTIVE;
                                 }
+                        } else if (packetSize >= 4 && packetSize < BUFFER_SIZE) {
+                                uint8_t tempBuf[COMMAND_BUFFER_SIZE];
+                                size_t bytesRead = udp.read(tempBuf, sizeof(tempBuf));
+                                processCommandPacket(tempBuf, bytesRead);
+                        } else {
+                                udp.flush();
                         }
-                } else if (packetSize > 0) {
-                        udp.flush();
                 }
         }
 #endif
@@ -338,19 +332,29 @@ void loop() {
                 while (Serial.available())
                         Serial.read();
         } else if (Serial.available() >= 4) {
-                uint8_t tempBuf[12];
+                uint8_t tempBuf[COMMAND_BUFFER_SIZE];
                 size_t bytesRead = Serial.readBytes(tempBuf, sizeof(tempBuf));
-                if (bytesRead >= 4 && tempBuf[0] == 0xFF && tempBuf[1] == 0xAA) {
-                        if (processConfigPacket(tempBuf, bytesRead)) {
-                                lastFrameTime = millis();
-                                currentState = STATE_ACTIVE;
-                        }
-                }
+                processCommandPacket(tempBuf, bytesRead);
                 while (Serial.available())
                         Serial.read();
         }
 #endif
 
+        // Animate independently of packet arrival so jitter/bursts don't show
+        // up as choppy motion. Frames only update the targets above.
+        if (currentState == STATE_ACTIVE || currentState == STATE_STATIC) {
+                unsigned long now = millis();
+                unsigned long dt = now - lastAnimationTime;
+                if (dt >= LED_ANIM_INTERVAL_MS) {
+                        float alpha = 1.0f - expf(-(float)dt / LED_SMOOTHING_TAU_MS);
+                        if (alpha > 1.0f)
+                                alpha = 1.0f;
+                        lastAnimationTime = now;
+                        updateLEDs(alpha);
+                }
+        } else {
+                lastAnimationTime = millis();
+        }
+
         yield();
 }
-

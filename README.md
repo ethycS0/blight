@@ -7,9 +7,9 @@ Real-time bias lighting system for Linux Wayland using ESP32 + WS2812B LEDs. Cap
 Uses `libportal` and `PipeWire` to capture screen borders, downsamples to an LED grid, and transmits color data to an ESP32 via UDP. Optimized for minimal CPU usage and low latency by accessing native PipeWire buffers.
 
 **Workflow:**
-1. Request screencast via XDG Desktop Portal (`libportal`).
+1. Request screencast via XDG Desktop Portal (`libportal`). (skipped in `static` mode)
 2. Capture buffers directly from PipeWire (supports DMA-BUF and MemFd).
-3. Sample edges (Left, Top, Right) and average colors.
+3. Sample edges (Left, Top, Right), average colors in linear light, and re-encode to sRGB.
 4. Transmit RGB data to ESP32 over WiFi/UDP.
 
 ## Hardware
@@ -40,19 +40,21 @@ This builds the `blight` binary. The default configuration uses WiFi communicati
 ## Usage
 
 ```bash
-./blight [brightness] [saturation] [smoothing]
+./blight live               # stream screen edge colors to the LEDs
+./blight static RRGGBB      # set a fixed color, no screen capture
 ```
 
-**Parameters:**
+**Modes:**
 
-- `brightness`: 0-255 (default: 150)
-- `saturation`: float (default: 1.0, determines color vibrancy. Try 1.5-2.0)
-- `smoothing`: 0.1-1.0 (default: 1.0, lower values = smoother transitions)
+- `live`: captures the screen via PipeWire and drives the LEDs from the average of the screen edges. It averages in perceptual (gamma-encoded) space and applies a fixed vibrance lift (no user-facing saturation knob), uses a fixed brightness of `250`, and the ESP32 eases toward each new value smoothly.
+- `static`: sends a single fixed color and exits. No screencast permission or PipeWire connection is used, so there is zero capture overhead. The ESP32 stays on that color indefinitely (it does not time out) until a `live` frame arrives. Accepts 3- or 6-digit hex with an optional `#` (`FFFFFF`, `#fff`, `2a1a4d`).
 
-**Example:**
+**Examples:**
 
 ```bash
-./blight 200 1.8 0.7
+./blight live
+./blight static FFFFFF
+./blight static 2a1a4d
 ```
 
 ## ESP32 Setup
@@ -62,13 +64,23 @@ This builds the `blight` binary. The default configuration uses WiFi communicati
    #define WIFI_SSID "YourSSID"
    #define WIFI_PASS "YourPassword"
    ```
-2. **Configuration:** Adjust `NUM_LEDS` and `DATA_PIN` in `esp32/main/main.ino` if necessary.
+2. **Configuration:** Adjust `NUM_LEDS` and `DATA_PIN` in `esp32/main/main.ino` if necessary. Light quality is fixed there via `LED_BRIGHTNESS` (250) and the smoothing time constant `LED_SMOOTHING_TAU_MS`.
 3. **Flash:** Use Arduino IDE or `arduino-cli` to flash the ESP32.
 4. **Network:** The host app expects the ESP32 at `192.168.1.100` (static IP) by default. You can change this in `src/main.c`.
 
 ## Performance Note
 
-CPU usage is minimal (<2%) as it avoids heavy processing pipelines. Note that any PipeWire screencast may cause minor FPS drops in some Wayland compositors (like GNOME/Mutter) due to how they handle buffer synchronization.
+Host CPU usage is low (around 3% of a single core on a 1440p capture). The
+expensive part of screencasting is reading edge pixels out of the (typically
+uncached) PipeWire/DMA-BUF frame, so the sampler is deliberately resolution
+independent: each edge box is sampled at an adaptive stride that keeps the
+number of pixels read per box roughly constant (512 by default) no matter how
+large the screen is, and each pixel is read with a single 32-bit load instead of
+three separate channel loads. Set `BLIGHT_SAMPLES` to a higher value for more
+accurate averages (more CPU) or lower for less. Note that any PipeWire
+screencast may still cause minor FPS drops in some Wayland compositors
+(like GNOME/Mutter) due to how they handle buffer synchronization. `static`
+mode skips capture entirely, so it has effectively zero runtime overhead once set.
 
 ## TODO
 

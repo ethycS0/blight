@@ -2,6 +2,7 @@ compile_flags.txt
 compile_commands.json
 creds.h
 blight
+nohup.out
 .arduino/
 .direnv/
 .cache/

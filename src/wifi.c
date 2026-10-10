@@ -10,6 +10,12 @@ static int g_sockfd = -1;
 static struct sockaddr_in g_esp_addr;
 
 static int resolve_dns(const char *hostname, char *ip_out, size_t ip_len) {
+        struct in_addr addr;
+        if (inet_pton(AF_INET, hostname, &addr) == 1) {
+                snprintf(ip_out, ip_len, "%s", hostname);
+                return 0;
+        }
+
         struct addrinfo hints, *result, *rp;
 
         memset(&hints, 0, sizeof(hints));

@@ -132,59 +132,63 @@ bool processConfigPacket(uint8_t *buffer, size_t size) {
                 FastLED.setBrightness(g_brightness);
                 
                 if (size >= 12) {
-                        memcpy(&g_saturation, &buffer[4], sizeof(float));
-                        memcpy(&g_smoothing, &buffer[8], sizeof(float));
+                        float temp_sat, temp_smooth;
+                        memcpy(&temp_sat, &buffer[4], sizeof(float));
+                        memcpy(&temp_smooth, &buffer[8], sizeof(float));
+                        if (!isnan(temp_sat) && isfinite(temp_sat) && temp_sat >= 0.0f && temp_sat <= 10.0f) {
+                                g_saturation = temp_sat;
+                        }
+                        if (!isnan(temp_smooth) && isfinite(temp_smooth) && temp_smooth >= 0.01f && temp_smooth <= 1.0f) {
+                                g_smoothing = temp_smooth;
+                        }
                 }
 
-                fill_solid(leds, NUM_LEDS, CRGB::Green);
-                FastLED.show();
-                delay(100);
-                FastLED.clear();
-                FastLED.show();
+                if (currentState != STATE_ACTIVE) {
+                        fill_solid(leds, NUM_LEDS, CRGB::Green);
+                        FastLED.show();
+                        delay(100);
+                        FastLED.clear();
+                        FastLED.show();
+                }
 
                 return true;
         }
         return false;
 }
 
-void waitForConfig() {
-        uint8_t configBuffer[12];
+void processFramePacket(const uint8_t *buffer, size_t size) {
+        if (size != BUFFER_SIZE) return;
 
-        currentState = STATE_WAITING_CONFIG;
+        for (int i = 0; i < NUM_LEDS; i++) {
+                int srcIndex = (i * RECEIVED_LEDS) / NUM_LEDS;
+                srcIndex = constrain(srcIndex, 0, RECEIVED_LEDS - 1);
+                int offset = srcIndex * 3;
 
-        while (true) {
-                bool hasData = false;
-                size_t bytesRead = 0;
+                float target_r = buffer[offset + 0] / 255.0f;
+                float target_g = buffer[offset + 1] / 255.0f;
+                float target_b = buffer[offset + 2] / 255.0f;
 
-#ifdef SERIAL
-                if (Serial.available() >= 12) {
-                        bytesRead = Serial.readBytes(configBuffer, 12);
-                        hasData = (bytesRead == 12);
-                } else if (Serial.available() >= 4) {
-                        bytesRead = Serial.readBytes(configBuffer, 4);
-                        hasData = (bytesRead == 4);
-                }
-#endif
+                boost_saturation_f(target_r, target_g, target_b, g_saturation);
 
-#ifdef WIFI
-                int packetSize = udp.parsePacket();
-                if (packetSize >= 4) {
-                        bytesRead = udp.read(configBuffer, sizeof(configBuffer));
-                        hasData = (bytesRead >= 4);
-                }
-#endif
-
-                if (hasData) {
-                        if (processConfigPacket(configBuffer, bytesRead)) {
-                                currentState = STATE_ACTIVE;
-                                lastFrameTime = millis();
-                                return;
-                        }
+                if (first_frame) {
+                        smoothed_colors[i].r = target_r;
+                        smoothed_colors[i].g = target_g;
+                        smoothed_colors[i].b = target_b;
+                } else {
+                        smoothed_colors[i].r = g_smoothing * target_r + (1.0f - g_smoothing) * smoothed_colors[i].r;
+                        smoothed_colors[i].g = g_smoothing * target_g + (1.0f - g_smoothing) * smoothed_colors[i].g;
+                        smoothed_colors[i].b = g_smoothing * target_b + (1.0f - g_smoothing) * smoothed_colors[i].b;
                 }
 
-                yield();
-                delay(10);
+                leds[i] = CRGB(
+                    (uint8_t)(constrain(smoothed_colors[i].r * 255.0f + 0.5f, 0.0f, 255.0f)),
+                    (uint8_t)(constrain(smoothed_colors[i].g * 255.0f + 0.5f, 0.0f, 255.0f)),
+                    (uint8_t)(constrain(smoothed_colors[i].b * 255.0f + 0.5f, 0.0f, 255.0f))
+                );
         }
+        first_frame = false;
+
+        FastLED.show();
 }
 
 void enterTimeoutState() {
@@ -192,13 +196,12 @@ void enterTimeoutState() {
                 FastLED.clear();
                 FastLED.show();
                 currentState = STATE_TIMEOUT;
+                first_frame = true;
 
 #ifdef SERIAL
                 while (Serial.available())
                         Serial.read();
 #endif
-
-                waitForConfig();
         }
 }
 
@@ -212,6 +215,32 @@ void optimizeWiFi() {
         conf.sta.listen_interval = 1;
         esp_wifi_set_config(WIFI_IF_STA, &conf);
         Serial.println("WiFi optimized for low latency");
+}
+
+void checkWiFiConnection() {
+        static bool wasConnected = false;
+        static unsigned long lastWifiRetry = 0;
+
+        if (WiFi.status() == WL_CONNECTED) {
+                if (!wasConnected) {
+                        Serial.println("\nWiFi connected");
+                        Serial.print("IP: ");
+                        Serial.println(WiFi.localIP());
+
+                        optimizeWiFi();
+                        udp.stop();
+                        udp.begin(UDP_PORT);
+                        wasConnected = true;
+                }
+        } else {
+                wasConnected = false;
+                if (millis() - lastWifiRetry > 5000) {
+                        lastWifiRetry = millis();
+                        Serial.println("\nWiFi disconnected. Attempting reconnect...");
+                        WiFi.disconnect();
+                        WiFi.reconnect();
+                }
+        }
 }
 #endif
 
@@ -238,7 +267,7 @@ void setup() {
 
         Serial.print("Connecting to WiFi");
         unsigned long wifiStart = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+        while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
                 delay(500);
                 Serial.print(".");
         }
@@ -249,115 +278,79 @@ void setup() {
                 Serial.println(WiFi.localIP());
 
                 optimizeWiFi();
+                udp.begin(UDP_PORT);
+                Serial.printf("UDP listening on port %d\n", UDP_PORT);
         } else {
-                Serial.println("\nWiFi connection failed!");
+                Serial.println("\nWiFi connection failed! Will retry in background.");
         }
-
-        udp.begin(UDP_PORT);
-
-        Serial.printf("UDP listening on port %d\n", UDP_PORT);
 #endif
 
         FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, NUM_LEDS);
-        FastLED.setBrightness(50);
+        FastLED.setBrightness(g_brightness);
 
         startupBlink();
 
-        waitForConfig();
+        currentState = STATE_WAITING_CONFIG;
 }
 
 void loop() {
+#ifdef WIFI
+        checkWiFiConnection();
+#endif
+
         if (currentState == STATE_ACTIVE && millis() - lastFrameTime > TIMEOUT_MS) {
                 enterTimeoutState();
-                return;
         }
 
-        bool dataAvailable = false;
-        size_t bytesRead = 0;
-
 #ifdef WIFI
-        int packetSize = udp.parsePacket();
-        if (packetSize >= BUFFER_SIZE) {
-                bytesRead = udp.read(rxBuffer, BUFFER_SIZE);
-                dataAvailable = (bytesRead == BUFFER_SIZE);
-        } else if (packetSize >= 4) {
-                uint8_t tempBuf[12];
-                bytesRead = udp.read(tempBuf, sizeof(tempBuf));
-                if (processConfigPacket(tempBuf, bytesRead)) {
-                        lastFrameTime = millis();
-                        if (currentState != STATE_ACTIVE) {
+        if (WiFi.status() == WL_CONNECTED) {
+                int packetSize = udp.parsePacket();
+                if (packetSize == BUFFER_SIZE) {
+                        size_t bytesRead = udp.read(rxBuffer, BUFFER_SIZE);
+                        if (bytesRead == BUFFER_SIZE) {
+                                processFramePacket(rxBuffer, BUFFER_SIZE);
+                                lastFrameTime = millis();
                                 currentState = STATE_ACTIVE;
                         }
-                        return;
+                } else if (packetSize >= 4 && packetSize < BUFFER_SIZE) {
+                        uint8_t tempBuf[12];
+                        size_t bytesRead = udp.read(tempBuf, sizeof(tempBuf));
+                        if (bytesRead >= 4 && tempBuf[0] == 0xFF && tempBuf[1] == 0xAA) {
+                                if (processConfigPacket(tempBuf, bytesRead)) {
+                                        lastFrameTime = millis();
+                                        currentState = STATE_ACTIVE;
+                                }
+                        }
+                } else if (packetSize > 0) {
+                        udp.flush();
                 }
-        } else if (packetSize > 0) {
-                udp.flush();
         }
 #endif
 
 #ifdef SERIAL
         if (Serial.available() >= BUFFER_SIZE) {
-                bytesRead = Serial.readBytes(rxBuffer, BUFFER_SIZE);
-                dataAvailable = (bytesRead == BUFFER_SIZE);
-
-                if (!dataAvailable) {
-                        while (Serial.available())
-                                Serial.read();
-                }
-        }
-#endif
-
-        if (dataAvailable) {
-                if (processConfigPacket(rxBuffer, bytesRead)) {
+                size_t bytesRead = Serial.readBytes(rxBuffer, BUFFER_SIZE);
+                if (bytesRead == BUFFER_SIZE) {
+                        processFramePacket(rxBuffer, BUFFER_SIZE);
                         lastFrameTime = millis();
-                        if (currentState != STATE_ACTIVE) {
-                                currentState = STATE_ACTIVE;
-                        }
-#ifdef SERIAL
-                        while (Serial.available())
-                                Serial.read();
-#endif
-                        return;
+                        currentState = STATE_ACTIVE;
                 }
-
-                for (int i = 0; i < NUM_LEDS; i++) {
-                        int srcIndex = (i * RECEIVED_LEDS) / NUM_LEDS;
-                        srcIndex = constrain(srcIndex, 0, RECEIVED_LEDS - 1);
-                        int offset = srcIndex * 3;
-
-                        float target_r = rxBuffer[offset + 0] / 255.0f;
-                        float target_g = rxBuffer[offset + 1] / 255.0f;
-                        float target_b = rxBuffer[offset + 2] / 255.0f;
-
-                        boost_saturation_f(target_r, target_g, target_b, g_saturation);
-
-                        if (first_frame) {
-                                smoothed_colors[i].r = target_r;
-                                smoothed_colors[i].g = target_g;
-                                smoothed_colors[i].b = target_b;
-                        } else {
-                                smoothed_colors[i].r = g_smoothing * target_r + (1.0f - g_smoothing) * smoothed_colors[i].r;
-                                smoothed_colors[i].g = g_smoothing * target_g + (1.0f - g_smoothing) * smoothed_colors[i].g;
-                                smoothed_colors[i].b = g_smoothing * target_b + (1.0f - g_smoothing) * smoothed_colors[i].b;
-                        }
-
-                        leds[i] = CRGB(
-                            (uint8_t)(smoothed_colors[i].r * 255.0f + 0.5f),
-                            (uint8_t)(smoothed_colors[i].g * 255.0f + 0.5f),
-                            (uint8_t)(smoothed_colors[i].b * 255.0f + 0.5f)
-                        );
-                }
-                first_frame = false;
-
-                FastLED.show();
-                lastFrameTime = millis();
-                currentState = STATE_ACTIVE;
-
-#ifdef SERIAL
                 while (Serial.available())
                         Serial.read();
-#endif
+        } else if (Serial.available() >= 4) {
+                uint8_t tempBuf[12];
+                size_t bytesRead = Serial.readBytes(tempBuf, sizeof(tempBuf));
+                if (bytesRead >= 4 && tempBuf[0] == 0xFF && tempBuf[1] == 0xAA) {
+                        if (processConfigPacket(tempBuf, bytesRead)) {
+                                lastFrameTime = millis();
+                                currentState = STATE_ACTIVE;
+                        }
+                }
+                while (Serial.available())
+                        Serial.read();
         }
+#endif
 
         yield();
 }
+

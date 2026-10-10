@@ -144,7 +144,6 @@ static int send_config(uint8_t brightness) {
                 return -1;
         }
 
-        usleep(600000);
         return 0;
 }
 
@@ -332,6 +331,10 @@ static void on_stream_process(void *data) {
                         printf("\r[FRAME] Transmission error\n");
                 }
 #endif
+                static uint64_t frame_counter = 0;
+                if (++frame_counter % 120 == 0) {
+                        send_config(g_brightness);
+                }
 #endif
 
                 if (buf->datas[0].type == SPA_DATA_DmaBuf && fd != -1) {
@@ -523,7 +526,7 @@ int main(int argc, const char *argv[]) {
         XdpPortal *portal = xdp_portal_new();
 
         xdp_portal_create_screencast_session(portal, XDP_OUTPUT_MONITOR, XDP_SCREENCAST_FLAG_NONE,
-                                             XDP_CURSOR_MODE_HIDDEN, XDP_PERSIST_MODE_TRANSIENT,
+                                             XDP_CURSOR_MODE_EMBEDDED, XDP_PERSIST_MODE_TRANSIENT,
                                              NULL, NULL, create_session_cb, NULL);
 
         g_main_loop_run(loop);

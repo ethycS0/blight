@@ -6,6 +6,7 @@
 #ifdef WIFI
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WebServer.h>
 #include <esp_wifi.h>
 #endif
 
@@ -37,6 +38,7 @@
 #define CMD_CONFIG 0x01 // [3] = brightness
 #define CMD_STATIC 0x02 // [3..5] = R, G, B
 #define CMD_LIVE 0x03   // no payload, resume screen-capture mode
+#define CMD_FORCE_LIVE 0x04 // no payload, resume live and clear phone override
 
 #ifdef WIFI
 
@@ -63,6 +65,10 @@ WiFiUDP udp;
 
 #define BUFFER_SIZE (RECEIVED_LEDS * 3)
 #define TIMEOUT_MS 10000
+// If WiFi is up but no UDP packet has arrived for this long, rebind the socket.
+// The socket can silently stop delivering packets while WiFi still answers
+// ping, which used to leave the strip dead until a manual reset.
+#define RX_WATCHDOG_MS 5000
 #define COMMAND_BUFFER_SIZE 8
 #define STARTUP_BLINK_DURATION 2000
 
@@ -83,7 +89,13 @@ bool first_frame = true;
 
 unsigned long lastFrameTime = 0;
 unsigned long lastAnimationTime = 0;
+unsigned long lastPacketTime = 0;
 SystemState currentState = STATE_WAITING_CONFIG;
+
+// When true, the host's live stream is ignored so the phone/web controls win
+// until the user taps "Live (screen)". Lets the phone take over without having
+// to stop blight live on the PC.
+bool manualOverride = false;
 
 void startupBlink() {
         unsigned long startTime = millis();
@@ -153,6 +165,8 @@ bool processCommandPacket(const uint8_t *buffer, size_t size) {
 
         switch (buffer[2]) {
         case CMD_CONFIG:
+                if (manualOverride) // phone/web controls the brightness
+                        return true;
                 g_brightness = buffer[3];
                 FastLED.setBrightness(g_brightness);
                 return true;
@@ -162,10 +176,22 @@ bool processCommandPacket(const uint8_t *buffer, size_t size) {
                         return false;
                 setAllTargets(buffer[3], buffer[4], buffer[5]);
                 currentState = STATE_STATIC;
+                manualOverride = false; // an explicit host static takes over
                 return true;
 
         case CMD_LIVE:
+                if (manualOverride) // let the phone keep control
+                        return true;
                 currentState = STATE_ACTIVE;
+                lastFrameTime = millis();
+                return true;
+
+        case CMD_FORCE_LIVE:
+                // Sent once when a new `blight live` session starts, so starting
+                // the PC tool reclaims control from the phone.
+                manualOverride = false;
+                currentState = STATE_ACTIVE;
+                lastFrameTime = millis();
                 return true;
         }
 
@@ -202,6 +228,125 @@ void enterTimeoutState() {
 }
 
 #ifdef WIFI
+// ---------------------------------------------------------------------------
+// Phone control: a tiny HTTP server so the strip can be driven from a browser
+// on the same WiFi. Endpoints are intentionally trivial GETs so they can also
+// be curled or bookmarked.
+// ---------------------------------------------------------------------------
+WebServer webServer(80);
+bool webServerStarted = false;
+
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Blight</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;margin:0;padding:24px;text-align:center}
+h1{font-size:1.3rem;font-weight:600;letter-spacing:.05em}
+.row{margin:18px 0}
+button{font-size:1rem;padding:12px 18px;margin:4px;border:0;border-radius:10px;background:#2a2a2a;color:#eee}
+button:active{background:#444}
+input[type=color]{width:88px;height:52px;border:0;background:none}
+input[type=range]{width:80%;vertical-align:middle}
+.sw{width:44px;height:44px;border-radius:10px;display:inline-block;margin:3px;border:1px solid #333;vertical-align:middle}
+.lbl{display:block;opacity:.6;font-size:.8rem;margin-bottom:6px}
+</style>
+</head>
+<body>
+<h1>BLIGHT</h1>
+<div class="row"><span class="lbl">Color</span><input type="color" id="c" value="#ff8800" onchange="setColor()"></div>
+<div class="row">
+<span class="sw" style="background:#ffffff" onclick="preset('#ffffff')"></span>
+<span class="sw" style="background:#ff0000" onclick="preset('#ff0000')"></span>
+<span class="sw" style="background:#ff8800" onclick="preset('#ff8800')"></span>
+<span class="sw" style="background:#ffee00" onclick="preset('#ffee00')"></span>
+<span class="sw" style="background:#00ff44" onclick="preset('#00ff44')"></span>
+<span class="sw" style="background:#0088ff" onclick="preset('#0088ff')"></span>
+<span class="sw" style="background:#8800ff" onclick="preset('#8800ff')"></span>
+</div>
+<div class="row"><span class="lbl">Brightness</span><input type="range" id="b" min="0" max="255" value="250" onchange="setBright()" oninput="setBright()"></div>
+<div class="row">
+<button onclick="go('/live')">Live (screen)</button>
+<button onclick="go('/off')">Off</button>
+</div>
+<script>
+function setColor(){var v=document.getElementById('c').value;
+var r=parseInt(v.substr(1,2),16),g=parseInt(v.substr(3,2),16),b=parseInt(v.substr(5,2),16);
+fetch('/set?r='+r+'&g='+g+'&b='+b);}
+function preset(v){document.getElementById('c').value=v;setColor();}
+function setBright(){fetch('/bright?b='+document.getElementById('b').value);}
+function go(u){fetch(u);}
+</script>
+</body>
+</html>
+)HTML";
+
+void handleRoot() { webServer.send_P(200, "text/html", INDEX_HTML); }
+
+void handleSet() {
+        if (!webServer.hasArg("r") || !webServer.hasArg("g") || !webServer.hasArg("b")) {
+                webServer.send(400, "text/plain", "need r,g,b");
+                return;
+        }
+        setAllTargets((uint8_t)webServer.arg("r").toInt(), (uint8_t)webServer.arg("g").toInt(),
+                      (uint8_t)webServer.arg("b").toInt());
+        currentState = STATE_STATIC;
+        manualOverride = true;
+        first_frame = true;
+        webServer.send(200, "text/plain", "ok");
+}
+
+void handleBright() {
+        if (!webServer.hasArg("b")) {
+                webServer.send(400, "text/plain", "need b");
+                return;
+        }
+        g_brightness = (uint8_t)constrain(webServer.arg("b").toInt(), 0, 255);
+        FastLED.setBrightness(g_brightness);
+        webServer.send(200, "text/plain", "ok");
+}
+
+void handleOff() {
+        setAllTargets(0, 0, 0);
+        currentState = STATE_STATIC;
+        manualOverride = true;
+        first_frame = true;
+        webServer.send(200, "text/plain", "ok");
+}
+
+void handleLive() {
+        manualOverride = false;
+        currentState = STATE_ACTIVE;
+        lastFrameTime = millis();
+        webServer.send(200, "text/plain", "ok");
+}
+
+void handleStatus() {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "state=%d brightness=%d override=%d", (int)currentState,
+                 (int)g_brightness, (int)manualOverride);
+        webServer.send(200, "text/plain", buf);
+}
+
+void startWebServer() {
+        if (webServerStarted)
+                return;
+        webServer.on("/", handleRoot);
+        webServer.on("/set", handleSet);
+        webServer.on("/bright", handleBright);
+        webServer.on("/off", handleOff);
+        webServer.on("/live", handleLive);
+        webServer.on("/status", handleStatus);
+        webServer.begin();
+        webServerStarted = true;
+        Serial.println("HTTP control on port 80");
+}
+#endif
+
+#ifdef WIFI
 void optimizeWiFi() {
         esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
@@ -226,6 +371,8 @@ void checkWiFiConnection() {
                         optimizeWiFi();
                         udp.stop();
                         udp.begin(UDP_PORT);
+                        startWebServer();
+                        lastPacketTime = millis();
                         wasConnected = true;
                 }
         } else {
@@ -275,6 +422,7 @@ void setup() {
 
                 optimizeWiFi();
                 udp.begin(UDP_PORT);
+                startWebServer();
                 Serial.printf("UDP listening on port %d\n", UDP_PORT);
         } else {
                 Serial.println("\nWiFi connection failed! Will retry in background.");
@@ -304,8 +452,10 @@ void loop() {
                 // back up and stall the socket.
                 int packetSize;
                 while ((packetSize = udp.parsePacket()) > 0) {
+                        lastPacketTime = millis();
                         if (packetSize == BUFFER_SIZE) {
-                                if (udp.read(rxBuffer, BUFFER_SIZE) == BUFFER_SIZE) {
+                                if (udp.read(rxBuffer, BUFFER_SIZE) == BUFFER_SIZE &&
+                                    !manualOverride) {
                                         processFramePacket(rxBuffer, BUFFER_SIZE);
                                         lastFrameTime = millis();
                                         currentState = STATE_ACTIVE;
@@ -318,6 +468,21 @@ void loop() {
                                 udp.flush();
                         }
                 }
+
+                // Self-heal a wedged socket: WiFi can stay connected (and even
+                // answer ping) while the UDP socket stops delivering. Rebind it
+                // after a period of silence so the strip recovers without a
+                // power cycle.
+                if (lastPacketTime != 0 && millis() - lastPacketTime > RX_WATCHDOG_MS) {
+                        Serial.println("UDP silent, rebinding socket");
+                        udp.stop();
+                        udp.begin(UDP_PORT);
+                        lastPacketTime = millis();
+                }
+
+                // Serve the phone control page. handleClient() returns quickly
+                // so it never disturbs the ~100Hz LED animation below.
+                webServer.handleClient();
         }
 #endif
 

@@ -77,6 +77,10 @@ static XdpSession *g_session;
 #define CMD_CONFIG 0x01 // [3] = brightness
 #define CMD_STATIC 0x02 // [3..5] = R, G, B
 #define CMD_LIVE 0x03   // no payload, resume screen-capture mode
+#define CMD_FORCE_LIVE 0x04 // no payload, resume live and clear phone override
+
+// How often to re-send the config/live handshake while streaming.
+#define HANDSHAKE_INTERVAL_MS 3000
 
 #define ESP_HOST "192.168.1.100"
 #define ESP_PORT 4210
@@ -149,6 +153,18 @@ static uint64_t get_time_ns() {
 
 static uint64_t last_frame_time = 0;
 
+// Content region of the frame, in real capture pixels, after cropping away
+// letterbox (top/bottom) and pillarbox (left/right) black bars. Recomputed
+// periodically rather than every frame; when !valid the full frame is used.
+typedef struct {
+        int x0, y0, x1, y1; // x1/y1 are exclusive
+        bool valid;
+} ContentCrop;
+
+static ContentCrop g_crop = {0, 0, 0, 0, false};
+static uint64_t last_detect_time = 0;
+static uint64_t last_handshake_time = 0;
+
 // Default light-quality settings (consumed by Settings / settings() below).
 // Rationale for each value lives at its point of use. Everything is
 // overridable through the environment for testing.
@@ -157,6 +173,9 @@ static uint64_t last_frame_time = 0;
 #define DEFAULT_VIBRANCE_REF 80.0f  // luminance at which vibrance is full
 #define DEFAULT_BRIGHT_REF 70.0f    // scene luminance for full LED brightness
 #define DEFAULT_MIN_BRIGHT 0.10f    // auto-brightness floor, 0..1
+#define DEFAULT_BLACK_DETECT 1      // skip letterbox/pillarbox black bars
+#define DEFAULT_BLACK_THRESHOLD 16  // max channel value still counted as black
+#define DEFAULT_DETECT_INTERVAL_MS 1000 // how often to re-scan for black bars
 
 static float clampf(float v, float lo, float hi) {
         return v < lo ? lo : (v > hi ? hi : v);
@@ -172,6 +191,9 @@ typedef struct {
         float bright_ref;   // scene luminance mapped to full LED brightness
         float min_bright;   // floor for auto-brightness, 0..1
         int auto_bright;    // dim the LEDs when the scene is dark
+        int black_detect;   // crop away letterbox/pillarbox black bars
+        int black_threshold;// max channel value still considered black
+        int detect_interval_ms; // minimum time between bar-detection scans
 } Settings;
 
 static float env_float(const char *name, float fallback) {
@@ -195,6 +217,10 @@ static const Settings *settings(void) {
                 s.bright_ref = env_float("BLIGHT_BRIGHT_REF", DEFAULT_BRIGHT_REF);
                 s.min_bright = env_float("BLIGHT_MIN_BRIGHT", DEFAULT_MIN_BRIGHT);
                 s.auto_bright = env_int("BLIGHT_AUTO_BRIGHT", 0);
+                s.black_detect = env_int("BLIGHT_BLACK_DETECT", DEFAULT_BLACK_DETECT);
+                s.black_threshold = env_int("BLIGHT_BLACK_THRESHOLD", DEFAULT_BLACK_THRESHOLD);
+                s.detect_interval_ms =
+                    env_int("BLIGHT_DETECT_INTERVAL_MS", DEFAULT_DETECT_INTERVAL_MS);
 
                 if (s.samples < 16)
                         s.samples = 16;
@@ -207,6 +233,12 @@ static const Settings *settings(void) {
                 if (s.bright_ref < 1.0f)
                         s.bright_ref = 1.0f;
                 s.min_bright = clampf(s.min_bright, 0.0f, 1.0f);
+                if (s.black_threshold < 0)
+                        s.black_threshold = 0;
+                if (s.black_threshold > 255)
+                        s.black_threshold = 255;
+                if (s.detect_interval_ms < 100)
+                        s.detect_interval_ms = 100;
         }
         return &s;
 }
@@ -294,6 +326,17 @@ static int send_command(uint8_t cmd, const uint8_t *payload, size_t len) {
         return 0;
 }
 
+// Re-asserts the ESP32's configuration and live mode. Sent once at session
+// start and then periodically (see HANDSHAKE_INTERVAL_MS) so the strip still
+// recovers if the ESP rebooted or missed the initial UDP packets. `force`
+// additionally clears any phone/web override, so starting a new live session
+// reclaims control from the phone.
+static void send_handshake(bool force) {
+        uint8_t brightness = BRIGHTNESS;
+        send_command(CMD_CONFIG, &brightness, 1);
+        send_command(force ? CMD_FORCE_LIVE : CMD_LIVE, NULL, 0);
+}
+
 // Averages a box of pixels in perceptual (gamma-encoded) space, then applies a
 // fixed vibrance lift. This keeps the LEDs as bright as the screen while
 // avoiding the washed-out look of a linear-light mean re-encoded through sRGB.
@@ -379,6 +422,172 @@ static void apply_auto_brightness(RGB *buf, int count) {
         }
 }
 
+// ---------------------------------------------------------------------------
+// Black bar (letterbox / pillarbox) detection.
+//
+// The generic approach used by bias-lighting software: probe inward from each
+// edge of the frame along a handful of lines and find where the black bars end.
+// A robust median over the probes gives the content rectangle, which the LED
+// zones are then mapped onto. Detection is deliberately periodic (see
+// detect_interval_ms) rather than per-frame, so the extra uncached reads are
+// amortized to near nothing.
+// ---------------------------------------------------------------------------
+
+#define DETECT_PROBES 16
+
+static inline bool pixel_is_black(const unsigned char *data, size_t max_size, uint32_t stride,
+                                  int x, int y) {
+        size_t off = (size_t)y * stride + (size_t)x * 4;
+        if (off + 4 > max_size)
+                return false;
+
+        uint32_t word;
+        memcpy(&word, data + off, sizeof(word));
+        unsigned r = (word >> g_shift_r) & 0xFF;
+        unsigned g = (word >> g_shift_g) & 0xFF;
+        unsigned b = (word >> g_shift_b) & 0xFF;
+        unsigned mx = r > g ? r : g;
+        mx = mx > b ? mx : b;
+        return mx <= (unsigned)settings()->black_threshold;
+}
+
+// Walks inward from one edge along a fixed row (vertical=false) or column
+// (vertical=true) and returns how many leading pixels are black. Returns -1 if
+// the run reached max_depth, i.e. the whole probe line is black. That happens
+// when the line sits inside a perpendicular bar (a pillarbox column while
+// probing for letterbox bars), so those probes are discarded rather than being
+// mistaken for a huge bar.
+static int scan_black_run(const unsigned char *data, size_t max_size, uint32_t stride, int width,
+                          int height, bool vertical, int line, int dir, int max_depth) {
+        for (int d = 0; d < max_depth; d++) {
+                int x, y;
+                if (vertical) {
+                        x = line;
+                        y = dir > 0 ? d : height - 1 - d;
+                } else {
+                        y = line;
+                        x = dir > 0 ? d : width - 1 - d;
+                }
+                if (x < 0 || x >= width || y < 0 || y >= height)
+                        return -1;
+                if (!pixel_is_black(data, max_size, stride, x, y))
+                        return d;
+        }
+        return -1;
+}
+
+// Median of the probes that produced a finite run; 0 if every probe was
+// discarded. Median (not mean) keeps a few stray dark-content probes from
+// dragging the detected bar around.
+static int median_run(const int *runs, int n) {
+        int vals[DETECT_PROBES];
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+                if (runs[i] >= 0)
+                        vals[m++] = runs[i];
+        }
+        if (m == 0)
+                return 0;
+
+        for (int i = 1; i < m; i++) {
+                int v = vals[i], j = i - 1;
+                while (j >= 0 && vals[j] > v) {
+                        vals[j + 1] = vals[j];
+                        j--;
+                }
+                vals[j + 1] = v;
+        }
+        return vals[m / 2];
+}
+
+static void detect_content_crop(const unsigned char *data, size_t max_size, uint32_t stride,
+                                int width, int height) {
+        const int max_depth_x = width / 4;
+        const int max_depth_y = height / 4;
+
+        // Pass 1: pillarbox. Probe rows in the middle half of the frame so any
+        // letterbox bars (fully black rows) are never scanned.
+        int left_runs[DETECT_PROBES], right_runs[DETECT_PROBES];
+        for (int i = 0; i < DETECT_PROBES; i++) {
+                int y = height / 4 + (int)((int64_t)(i + 1) * (height / 2) / (DETECT_PROBES + 1));
+                left_runs[i] =
+                    scan_black_run(data, max_size, stride, width, height, false, y, +1, max_depth_x);
+                right_runs[i] =
+                    scan_black_run(data, max_size, stride, width, height, false, y, -1, max_depth_x);
+        }
+        int left = median_run(left_runs, DETECT_PROBES);
+        int right = median_run(right_runs, DETECT_PROBES);
+
+        int cx0 = left;
+        int cx1 = width - right;
+        int cw = cx1 - cx0;
+        if (cw < width / 4) { // implausible: treat as no pillarbox
+                cx0 = 0;
+                cx1 = width;
+                cw = width;
+                left = right = 0;
+        }
+
+        // Pass 2: letterbox. Probe columns in the middle half of the detected
+        // content width so residual pillarbox columns are avoided.
+        int top_runs[DETECT_PROBES], bottom_runs[DETECT_PROBES];
+        for (int i = 0; i < DETECT_PROBES; i++) {
+                int x = cx0 + cw / 4 +
+                        (int)((int64_t)(i + 1) * (cw / 2) / (DETECT_PROBES + 1));
+                top_runs[i] =
+                    scan_black_run(data, max_size, stride, width, height, true, x, +1, max_depth_y);
+                bottom_runs[i] =
+                    scan_black_run(data, max_size, stride, width, height, true, x, -1, max_depth_y);
+        }
+        int top = median_run(top_runs, DETECT_PROBES);
+        int bottom = median_run(bottom_runs, DETECT_PROBES);
+
+        int x0 = left;
+        int y0 = top;
+        int x1 = width - right;
+        int y1 = height - bottom;
+
+        // A dark scene can look like a bar. Refuse to crop below a sane minimum
+        // (standard 16:9 / 4:3 content never loses more than ~40%).
+        if (x1 - x0 < width * 3 / 5 || y1 - y0 < height * 3 / 5) {
+                g_crop.x0 = 0;
+                g_crop.y0 = 0;
+                g_crop.x1 = width;
+                g_crop.y1 = height;
+                g_crop.valid = false;
+                return;
+        }
+
+        g_crop.x0 = x0;
+        g_crop.y0 = y0;
+        g_crop.x1 = x1;
+        g_crop.y1 = y1;
+        g_crop.valid = (x0 > 0 || y0 > 0 || x1 < width || y1 < height);
+
+#ifdef DEBUG
+        g_print("[detect] bars L%d R%d T%d B%d -> content %dx%d @ (%d,%d)%s\n", left, right, top,
+                bottom, x1 - x0, y1 - y0, x0, y0, g_crop.valid ? "" : " (full frame)");
+#endif
+}
+
+// Runs detection at most once per detect_interval_ms. Returns true if a fresh
+// scan was performed (the crop is then current).
+static bool maybe_detect_crop(uint64_t now, const unsigned char *data, size_t max_size,
+                              uint32_t stride, int width, int height) {
+        const Settings *st = settings();
+        if (!st->black_detect) {
+                g_crop.valid = false;
+                return false;
+        }
+        if (last_detect_time != 0 &&
+            now - last_detect_time < (uint64_t)st->detect_interval_ms * 1000000ULL)
+                return false;
+
+        last_detect_time = now;
+        detect_content_crop(data, max_size, stride, width, height);
+        return true;
+}
+
 static void on_stream_process(void *data) {
         struct PipeWireCtx *ctx = data;
         struct pw_buffer *pw_buf;
@@ -443,41 +652,71 @@ static void on_stream_process(void *data) {
                         ioctl(buf->datas[0].fd, DMA_BUF_IOCTL_SYNC, &sync);
                 }
 
+                // Periodically re-scan for letterbox/pillarbox bars and update
+                // the content crop used to place the LED zones.
+                maybe_detect_crop(now, raw_pixels, size, current_stride, ctx->real_width,
+                                  ctx->real_height);
+
+                // Re-assert config/live now and then so a rebooted or wedged
+                // ESP32 recovers on its own.
+                if (now - last_handshake_time >= (uint64_t)HANDSHAKE_INTERVAL_MS * 1000000ULL) {
+                        last_handshake_time = now;
+                        send_handshake(false);
+                }
+
                 memset(g_final_buffer, 0, sizeof(g_final_buffer));
                 int buffer_index = 0;
 
-                int real_box_w = (CAPTURE_DEPTH * ctx->real_width) / CAPTURE_WIDTH;
-                int real_box_h = (CAPTURE_DEPTH * ctx->real_height) / CAPTURE_HEIGHT;
-                if (real_box_w < 1)
-                        real_box_w = 1;
-                if (real_box_h < 1)
-                        real_box_h = 1;
+                // Map the LED zones onto the content region (full frame when no
+                // bars were detected). "thick" is the physical size of one LED
+                // segment; the tiling dimension follows the content extent so
+                // the strips always cover exactly the visible picture.
+                int content_x0 = 0, content_y0 = 0;
+                int content_w = ctx->real_width, content_h = ctx->real_height;
+                if (g_crop.valid) {
+                        content_x0 = g_crop.x0;
+                        content_y0 = g_crop.y0;
+                        content_w = g_crop.x1 - g_crop.x0;
+                        content_h = g_crop.y1 - g_crop.y0;
+                }
+
+                int thick_w = (CAPTURE_DEPTH * ctx->real_width) / CAPTURE_WIDTH;
+                int thick_h = (CAPTURE_DEPTH * ctx->real_height) / CAPTURE_HEIGHT;
+                int edge_box_h = (CAPTURE_DEPTH * content_h) / CAPTURE_HEIGHT;
+                int edge_box_w = (CAPTURE_DEPTH * content_w) / CAPTURE_WIDTH;
+                if (thick_w < 1)
+                        thick_w = 1;
+                if (thick_h < 1)
+                        thick_h = 1;
+                if (edge_box_h < 1)
+                        edge_box_h = 1;
+                if (edge_box_w < 1)
+                        edge_box_w = 1;
 
                 // 1. LEFT EDGE: Bottom to top
                 for (int y = CAPTURE_HEIGHT - CAPTURE_DEPTH; y >= 0; y -= CAPTURE_DEPTH) {
-                        int real_x = 0;
-                        int real_y = (y * ctx->real_height) / CAPTURE_HEIGHT;
+                        int real_x = content_x0;
+                        int real_y = content_y0 + (y * content_h) / CAPTURE_HEIGHT;
 
-                        average_pixel_box(raw_pixels, size, real_x, real_y, real_box_w, real_box_h,
+                        average_pixel_box(raw_pixels, size, real_x, real_y, thick_w, edge_box_h,
                                           current_stride, &g_final_buffer[buffer_index++]);
                 }
 
                 // 2. TOP EDGE: Left to right
                 for (int x = 0; x < CAPTURE_WIDTH; x += CAPTURE_DEPTH) {
-                        int real_x = (x * ctx->real_width) / CAPTURE_WIDTH;
-                        int real_y = 0;
+                        int real_x = content_x0 + (x * content_w) / CAPTURE_WIDTH;
+                        int real_y = content_y0;
 
-                        average_pixel_box(raw_pixels, size, real_x, real_y, real_box_w, real_box_h,
+                        average_pixel_box(raw_pixels, size, real_x, real_y, edge_box_w, thick_h,
                                           current_stride, &g_final_buffer[buffer_index++]);
                 }
 
                 // 3. RIGHT EDGE: Top to bottom
                 for (int y = 0; y < CAPTURE_HEIGHT; y += CAPTURE_DEPTH) {
-                        int real_x =
-                            ((CAPTURE_WIDTH - CAPTURE_DEPTH) * ctx->real_width) / CAPTURE_WIDTH;
-                        int real_y = (y * ctx->real_height) / CAPTURE_HEIGHT;
+                        int real_x = content_x0 + content_w - thick_w;
+                        int real_y = content_y0 + (y * content_h) / CAPTURE_HEIGHT;
 
-                        average_pixel_box(raw_pixels, size, real_x, real_y, real_box_w, real_box_h,
+                        average_pixel_box(raw_pixels, size, real_x, real_y, thick_w, edge_box_h,
                                           current_stride, &g_final_buffer[buffer_index++]);
                 }
 
@@ -614,9 +853,8 @@ static void start_session_cb(GObject *source, GAsyncResult *res, gpointer data) 
 #endif
                 exit(1);
         }
-        uint8_t brightness = BRIGHTNESS;
-        send_command(CMD_CONFIG, &brightness, 1);
-        send_command(CMD_LIVE, NULL, 0);
+        send_handshake(true);
+        last_handshake_time = get_time_ns();
 #ifdef DEBUG
         printf("Live mode requested (brightness=%d)\n", BRIGHTNESS);
 #endif
